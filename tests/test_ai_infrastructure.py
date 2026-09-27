@@ -106,7 +106,8 @@ def test_context_builder_tolerates_missing_sources():
     assert frames["4h"]["tendance"] in ("haussière", "baissière", "neutre / range")
     assert frames["1d"]["disponible"] is False
     assert len(context["dernieres_bougies"]["valeurs"]) == 24
-    assert context["derives"] is None and context["fear_greed"] is None
+    assert context["derives"] is None and context["fear_greed_crypto"] is None
+    assert context["instrument"]["classe"] == "crypto" and "milieu_d_influence" in context
     assert summarize_timeframe(generate_synthetic_candles(bars=30))["disponible"] is False
 
 

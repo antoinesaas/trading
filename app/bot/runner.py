@@ -1,8 +1,17 @@
-"""Boucle temps réel du bot : interroge les données de marché et alimente le moteur.
+"""Flux de marché permanent et états du bot.
 
-États : STOPPED (boucle arrêtée), RUNNING (entrées autorisées), PAUSED (boucle active :
-les stops/objectifs restent gérés, mais aucune nouvelle entrée), HALTED (kill-switch
-drawdown déclenché : réinitialisation manuelle requise).
+Le flux de prix tourne dès le démarrage du serveur, que le bot soit en marche ou non :
+les graphiques sont en direct et les stops / objectifs des positions ouvertes sont
+toujours gérés (comme des ordres stop laissés chez un broker).
+
+États (ils ne concernent que les NOUVELLES décisions) :
+- RUNNING : Claude analyse les opportunités et peut ouvrir des positions ;
+- PAUSED  : aucune nouvelle entrée, les positions restent gérées ;
+- STOPPED : idem, et aucune analyse IA ;
+- HALTED  : kill-switch drawdown déclenché (réinitialisation manuelle requise).
+
+Cadence : crypto à chaque cycle (``poll_interval``), marchés à horaires (actions, ETF,
+forex) toutes les 60 s quand ils sont ouverts et toutes les 15 min quand ils sont fermés.
 """
 
 from __future__ import annotations
@@ -19,10 +28,15 @@ from app.core.events import EventBus, EventType
 from app.core.types import Candle, ensure_utc, utcnow
 from app.database.repository import TradingRepository
 from app.engine.trading_engine import TradingEngine
-from app.market.data_provider import BINANCE_MAX_LIMIT, MarketDataProvider
+from app.market.data_provider import BINANCE_MAX_LIMIT, MarketDataError, MarketDataProvider
+from app.market.sessions import market_open
 from app.market.timeframes import timeframe_seconds
+from app.market.universe import instrument
 
 logger = logging.getLogger(__name__)
+OPEN_MARKET_POLL = timedelta(seconds=60)
+CLOSED_MARKET_POLL = timedelta(minutes=15)
+ERROR_RETRY = timedelta(seconds=60)  # nouvel essai après une erreur de données
 
 
 class BotStatus(StrEnum):
@@ -60,8 +74,11 @@ class BotRunner:
         self._status = BotStatus.STOPPED
         self._task: asyncio.Task[None] | None = None
         self._warmed: set[str] = set()
+        self._next_poll: dict[str, datetime] = {}
         self._last_processed = dict(last_processed or {})
         self.forming: dict[str, Candle] = {}
+        self.symbol_errors: dict[str, str] = {}
+        self._scan_all = False  # au démarrage : tous les marchés sont examinés une fois
         self.last_tick: datetime | None = None
         self.last_error: str | None = None
         self.engine.entries_enabled = False
@@ -75,6 +92,22 @@ class BotRunner:
     def is_running(self) -> bool:
         return self.status is BotStatus.RUNNING
 
+    @property
+    def feed_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def start_feed(self) -> None:
+        """Démarre le flux de marché (appelé au lancement du serveur)."""
+        if not self.feed_running:
+            self._task = asyncio.create_task(self._loop(), name="market-feed")
+
+    async def shutdown(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
     async def start(self) -> BotStatus:
         if self.engine.risk.halted:
             raise BotStateError("Kill-switch actif : réinitialisez-le avant de redémarrer.")
@@ -82,9 +115,9 @@ class BotRunner:
             return self.status
         self._status = BotStatus.RUNNING
         self.engine.entries_enabled = True
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._loop(), name="bot-loop")
-        self._announce("Bot démarré (paper trading)")
+        self._scan_all = True
+        self.start_feed()
+        self._announce("Bot démarré (paper trading) : Claude analyse les marchés ouverts")
         return self.status
 
     async def pause(self) -> BotStatus:
@@ -98,12 +131,7 @@ class BotRunner:
     async def stop(self) -> BotStatus:
         self._status = BotStatus.STOPPED
         self.engine.entries_enabled = False
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
-        self._announce("Bot arrêté : positions ouvertes conservées, rattrapage au prochain démarrage")
+        self._announce("Bot arrêté : plus de nouvelles décisions ; les stops restent surveillés")
         return self.status
 
     def reset_halt(self) -> BotStatus:
@@ -132,27 +160,52 @@ class BotRunner:
                                                  "status": self.status.value})
             await asyncio.sleep(self.poll_interval)
 
+    def _due(self, symbol: str, now: datetime) -> bool:
+        return now >= self._next_poll.get(symbol, now)
+
+    def _schedule(self, symbol: str, now: datetime) -> None:
+        calendar = instrument(symbol).calendar
+        if calendar == "24/7":
+            self._next_poll[symbol] = now
+        else:
+            self._next_poll[symbol] = now + (OPEN_MARKET_POLL if market_open(calendar, now) else CLOSED_MARKET_POLL)
+
     async def tick(self) -> None:
+        now = utcnow()
+        due = [s for s in self.symbols if self._due(s, now)]
+        results = await asyncio.gather(*(self._fetch_for(s) for s in due), return_exceptions=True)
         fresh: list[str] = []
-        for symbol in self.symbols:
-            if symbol not in self._warmed:
-                await self._warm_up(symbol)
-            if await self._process(symbol):
+        for symbol, result in zip(due, results, strict=True):
+            self._schedule(symbol, now)
+            if isinstance(result, BaseException):
+                if not isinstance(result, MarketDataError | OSError | ValueError):
+                    raise result
+                self._next_poll[symbol] = now + ERROR_RETRY  # source en panne : ne pas la marteler
+                self.symbol_errors[symbol] = str(result)
+                logger.warning("%s : données indisponibles (%s)", symbol, result)
+                continue
+            self.symbol_errors.pop(symbol, None)
+            if self._process(symbol, result):
                 fresh.append(symbol)
         self.last_tick = utcnow()
         self._persist_progress()
         if self.after_tick is not None and self._status is BotStatus.RUNNING:
+            if self._scan_all:  # premier cycle après Start : sans attendre la prochaine clôture
+                self._scan_all = False
+                fresh = [s for s in self.symbols if s in self._warmed and s not in self.symbol_errors]
             await self.after_tick(fresh)
 
-    async def _fetch(self, symbol: str, limit: int) -> list[Candle]:
+    async def _fetch_for(self, symbol: str) -> list[Candle]:
+        limit = self.engine.window_size + 1 if symbol not in self._warmed else \
+            self._fetch_limit(self.engine.last_closed_time(symbol))
         return await asyncio.to_thread(self.provider.fetch_candles, symbol, self.timeframe, limit)
 
-    async def _warm_up(self, symbol: str) -> None:
-        candles = [c for c in await self._fetch(symbol, self.engine.window_size + 1) if c.closed]
+    def _warm_up(self, symbol: str, candles: list[Candle]) -> None:
+        closed = [c for c in candles if c.closed]
         raw_cutoff = self._last_processed.get(symbol)
         cutoff = ensure_utc(datetime.fromisoformat(raw_cutoff)) if raw_cutoff else None
-        history = [c for c in candles if cutoff is None or c.open_time <= cutoff]
-        missed = [c for c in candles if cutoff is not None and c.open_time > cutoff]
+        history = [c for c in closed if cutoff is None or c.open_time <= cutoff]
+        missed = [c for c in closed if cutoff is not None and c.open_time > cutoff]
         self.engine.warm_up(history)
         for candle in missed:  # rattrapage des sorties manquées pendant l'arrêt, sans nouvelle entrée
             self.engine.on_bar_update(candle)
@@ -160,10 +213,11 @@ class BotRunner:
         self._warmed.add(symbol)
         logger.info("%s : %d bougies chargées, %d rattrapées", symbol, len(history), len(missed))
 
-    async def _process(self, symbol: str) -> bool:
+    def _process(self, symbol: str, candles: list[Candle]) -> bool:
         """Traite les nouvelles bougies ; retourne ``True`` si une bougie récente vient de clôturer."""
+        if symbol not in self._warmed:
+            self._warm_up(symbol, candles)
         last = self.engine.last_closed_time(symbol)
-        candles = await self._fetch(symbol, self._fetch_limit(last))
         closed = [c for c in candles if c.closed and (last is None or c.open_time > last)]
         now = utcnow()
         fresh = False

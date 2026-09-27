@@ -6,6 +6,12 @@ Déclencheurs :
 - ``manual``      : bouton « Analyser maintenant » du dashboard ;
 - ``review``      : revue périodique d'une position ouverte.
 
+À chaque cycle, les marchés ouverts dont une bougie vient de clôturer sont classés par score
+du scanner ; seuls les meilleurs sont soumis à Claude (``max_analyses_per_cycle``), avec un
+panorama de tous les marchés pour qu'il compare. Après chaque trade clôturé, Claude en tire
+une leçon réinjectée dans les décisions suivantes, et le seuil de confiance minimal se
+relève automatiquement si les trades à faible confiance perdent.
+
 Avant tout appel payant, les blocages gratuits sont vérifiés (bot en pause, limites de
 risque, positions max, heures de marché, blackout d'annonce). Les appels à Claude
 tournent dans un thread ; la décision est appliquée dans la boucle d'événements, via le
@@ -16,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -25,15 +32,17 @@ from app.ai.claude import ClaudeError
 from app.ai.context import MarketContextBuilder
 from app.ai.costs import BudgetExceededError
 from app.ai.decision import ClaudeTrader, TradeDecision
-from app.core.events import EventBus, EventType
+from app.core.events import EngineEvent, EventBus, EventType
 from app.core.types import Direction, OrderIntent, OrderType, Signal, SignalSource, utcnow
 from app.database.repository import TradingRepository
 from app.engine.trading_engine import TradePlan, TradingEngine
-from app.market.sessions import entry_window_block, market_clock
+from app.market.sessions import entry_window_block, market_clock, market_open
+from app.market.universe import instrument
 from app.market.timeframes import timeframe_seconds
 
 logger = logging.getLogger(__name__)
-MAX_TIME_STOP_HOURS = 24 * 7
+MAX_TIME_STOP_HOURS = 24 * 90
+MIN_TRADES_FOR_CALIBRATION = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +57,7 @@ class AITraderConfig:
     no_trade_hours: frozenset[int] = frozenset()
     max_spread_pct: float = 0.002
     max_concurrent: int = 2
+    max_analyses_per_cycle: int = 2
 
 
 class AITrader:
@@ -66,15 +76,20 @@ class AITrader:
         self._last_eval: dict[str, datetime] = {}
         self._last_review: dict[str, datetime] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._threshold_cache: tuple[float, tuple[float, str]] | None = None
+        bus.subscribe(self._on_event)
 
     # -- Déclencheurs ---------------------------------------------------------------
     async def after_tick(self, fresh_symbols: list[str]) -> None:
         """Appelé par la boucle du bot après chaque cycle (non bloquant)."""
         now = utcnow()
         hints = {s.symbol: s for s in self.engine.drain_candidates()}
-        for symbol in fresh_symbols:
-            if self.engine.portfolio.position(symbol) is None and self._setup_worth_asking(symbol, hints, now):
-                self.spawn(self.evaluate(symbol, "setup", hints.get(symbol)))
+        candidates = [s for s in fresh_symbols
+                      if self.engine.portfolio.position(s) is None
+                      and market_open(instrument(s).calendar, now) and self._setup_worth_asking(s, hints, now)]
+        candidates.sort(key=lambda s: (s in hints, self._best_score(s)), reverse=True)
+        for symbol in candidates[: self.config.max_analyses_per_cycle]:
+            self.spawn(self.evaluate(symbol, "setup", hints.get(symbol)))
         for symbol in list(self.engine.portfolio.positions):
             last = self._last_review.get(symbol)
             if last is None or now - last >= timedelta(minutes=self.config.review_minutes):
@@ -90,12 +105,15 @@ class AITrader:
         task.add_done_callback(self._tasks.discard)
         return task
 
+    def _best_score(self, symbol: str) -> float:
+        analysis = self.engine.last_analysis(symbol)
+        scores = [v for k, v in (analysis.indicators if analysis else {}).items() if k.startswith("score_")]
+        return max(scores, default=0.0)
+
     def _setup_worth_asking(self, symbol: str, hints: dict[str, Signal], now: datetime) -> bool:
         if symbol in hints:
             return True
-        analysis = self.engine.last_analysis(symbol)
-        scores = [v for k, v in (analysis.indicators if analysis else {}).items() if k.startswith("score_")]
-        if not scores or max(scores) < self.config.min_scan_score:
+        if self._best_score(symbol) < self.config.min_scan_score:
             return False
         last = self._last_eval.get(symbol)
         return last is None or now - last >= timedelta(hours=self.config.reevaluate_hours)
@@ -167,8 +185,9 @@ class AITrader:
             return "hold", "Claude préfère ne pas entrer", None
         if decision.action not in ("OPEN_LONG", "OPEN_SHORT") or decision.entry is None:
             return "ignored", f"Action {decision.action} sans position ouverte", None
-        if decision.confidence < self.config.min_confidence:
-            return "rejected", f"Confiance {decision.confidence:.2f} < {self.config.min_confidence:.2f}", None
+        threshold, _ = self.min_confidence()
+        if decision.confidence < threshold:
+            return "rejected", f"Confiance {decision.confidence:.2f} < seuil {threshold:.2f}", None
         spread = (context.get("marche", {}).get("carnet_ordres") or {}).get("spread_pct")
         if spread is not None and spread > self.config.max_spread_pct:
             return "rejected", f"Spread {spread:.4%} trop large", None
@@ -233,6 +252,68 @@ class AITrader:
             return ("executed" if "->" in result else "rejected"), result
         return "hold", "Position conservée"
 
+    # -- Apprentissage ----------------------------------------------------------------------
+    def min_confidence(self) -> tuple[float, str]:
+        """Seuil de confiance effectif : relevé si les trades à faible confiance perdent."""
+        threshold, reason = self.config.min_confidence, "seuil de base"
+        calibration = self.repo.ai_track_record()["calibration_par_confiance"]
+        for bucket, floor in (("<0.70", 0.70), ("0.70-0.80", 0.80)):
+            stats = calibration.get(bucket)
+            if stats and stats["trades"] >= MIN_TRADES_FOR_CALIBRATION and stats["r_moyen"] < 0 and floor > threshold:
+                threshold = floor
+                reason = f"relevé : les trades à confiance {bucket} perdent en moyenne ({stats['r_moyen']:+.2f} R)"
+        return min(threshold, 0.85), reason
+
+    def threshold_status(self, max_age: float = 60.0) -> tuple[float, str]:
+        """Seuil effectif mis en cache (le dashboard le lit chaque seconde)."""
+        if self._threshold_cache is None or time.monotonic() - self._threshold_cache[0] > max_age:
+            self._threshold_cache = (time.monotonic(), self.min_confidence())
+        return self._threshold_cache[1]
+
+    def _on_event(self, event: EngineEvent) -> None:
+        if event.type is EventType.TRADE and event.payload.get("decision_id"):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self.spawn(self._learn(event.payload))
+
+    async def _learn(self, trade: dict[str, Any]) -> None:
+        """Post-mortem d'un trade décidé par Claude : la leçon est réinjectée dans les décisions."""
+        decision = self.repo.decision_details(int(trade["decision_id"]))
+        report = {"trade": {k: trade.get(k) for k in ("symbol", "direction", "entry_time", "exit_time", "entry_price",
+                                                        "exit_price", "net_pnl", "r_multiple", "reason",
+                                                        "max_favorable_r")},
+                  "decision_initiale": decision}
+        try:
+            lesson = await asyncio.to_thread(self.trader.lesson, report)
+        except (ClaudeError, BudgetExceededError) as exc:
+            logger.warning("Leçon non générée pour la décision %s : %s", trade["decision_id"], exc)
+            return
+        self.repo.save_lesson(int(trade["decision_id"]), lesson.model_dump())
+        logger.info("Leçon apprise (%s, %+.2f R) : %s", trade.get("symbol"), trade.get("r_multiple", 0),
+                    lesson.rule_for_next_time)
+        self.bus.publish(EventType.AI_DECISION, {"id": trade["decision_id"], "symbol": trade.get("symbol"),
+                                                 "trigger": "lesson", "status": "lesson",
+                                                 "reason": lesson.rule_for_next_time})
+
+    def panorama(self) -> dict[str, Any]:
+        """Vue d'ensemble de tous les marchés suivis (pour comparer les opportunités)."""
+        now, result = utcnow(), {}
+        for symbol in self.config.symbols:
+            window = self.engine.window(symbol)
+            analysis = self.engine.last_analysis(symbol)
+            price = self.engine.last_price(symbol)
+            change = (price / window[-25].close - 1) * 100 if price and len(window) > 25 else None
+            result[symbol] = {
+                "classe": instrument(symbol).asset_class, "ouvert": market_open(instrument(symbol).calendar, now),
+                "prix": price, "variation_24_bougies_pct": round(change, 2) if change is not None else None,
+                "score_scanner": round(self._best_score(symbol), 1) if analysis else None,
+                "adx": round(analysis.indicators["adx"], 1) if analysis and "adx" in analysis.indicators else None,
+                "position": self.engine.portfolio.position(symbol) is not None,
+            }
+        return result
+
     # -- Contexte -------------------------------------------------------------------------
     def _portfolio_view(self, symbol: str) -> dict[str, Any]:
         """Photographie du portefeuille, lue dans la boucle d'événements."""
@@ -251,6 +332,7 @@ class AITrader:
             })
         return {
             "prix_actuel": engine.last_price(symbol),
+            "panorama_des_marches": self.panorama(),
             "capital": {"equity": round(account.equity, 2), "balance": round(engine.portfolio.balance, 2),
                         "cash_disponible": round(account.available_cash, 2),
                         "drawdown_pct": round(account.drawdown * 100, 2),
@@ -267,7 +349,7 @@ class AITrader:
                 "risque_meme_sens_max_pct": lim.max_correlated_risk * 100,
                 "rendement_risque_min": lim.min_reward_risk,
                 "stop_en_atr": [lim.min_stop_atr, lim.max_stop_atr],
-                "positions_max": lim.max_open_positions, "confiance_min": self.config.min_confidence,
+                "positions_max": lim.max_open_positions, "confiance_min": self.min_confidence()[0],
                 "frais_par_cote_pct": lim.fee_rate * 100},
         }
 

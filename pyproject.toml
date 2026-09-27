@@ -13,3 +13,8 @@ filterwarnings = ["ignore:Using `httpx` with `starlette.testclient`:UserWarning"
 [tool.ruff]
 line-length = 110
 target-version = "py312"
+
+[tool.ruff.lint]
+# Erreurs réelles, bugs probables et syntaxe moderne (le style des imports reste libre).
+select = ["E", "F", "W", "B", "UP", "SIM", "C4"]
+ignore = ["E501", "C408"]  # longueur gérée à la relecture ; dict(...) utilisé pour les gabarits

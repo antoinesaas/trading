@@ -26,6 +26,7 @@ from app.risk.money_management import OpenRisk, PerformanceSnapshot, risk_fracti
 
 if TYPE_CHECKING:
     from app.trading.positions import Position
+    from app.trading.specs import MarketSpecs
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,7 @@ def trailing_stop_level(position: Position, close: float, atr: float,
 
 
 def breakeven_level(position: Position, close: float, fee_rate: float) -> float | None:
+    """``fee_rate`` : frais par côté de l'instrument."""
     """Stop au point mort (frais aller-retour couverts) une fois ``breakeven_at_r`` atteint."""
     if position.breakeven_at_r <= 0 or position.breakeven_done:
         return None
@@ -202,7 +204,7 @@ def open_risk(positions: object, equity: float) -> OpenRisk:
     """Perte encore possible si tous les stops étaient touchés (0 si stop au-delà de l'entrée)."""
     long_risk = short_risk = 0.0
     for p in positions:  # type: ignore[attr-defined]
-        loss = max(0.0, p.direction.sign * (p.entry_price - p.stop_loss)) * p.quantity
+        loss = max(0.0, p.direction.sign * (p.entry_price - p.stop_loss)) * p.quantity * p.fx_rate
         if p.direction is Direction.LONG:
             long_risk += loss
         else:
@@ -216,9 +218,10 @@ def open_risk(positions: object, equity: float) -> OpenRisk:
 
 class RiskManager:
     def __init__(self, limits: RiskLimits, exit_params: ExitParams, currency: str = "USDT",
-                 log: logging.Logger | None = None) -> None:
+                 log: logging.Logger | None = None, specs: MarketSpecs | None = None) -> None:
         self.log = log or logger
         self.limits = limits
+        self.specs = specs
         self.exit_params = exit_params
         self.currency = currency
         self.halted = False
@@ -286,6 +289,7 @@ class RiskManager:
         )
         heat_left = lim.max_portfolio_risk - account.open_risk.total
         correlated_left = lim.max_correlated_risk - account.open_risk.same_direction(signal.direction)
+        costs, fx = self._costs(signal.symbol)
         if min(heat_left, correlated_left) < fraction:
             fraction = min(heat_left, correlated_left)
             notes.append(f"limité par le risque ouvert (total {account.open_risk.total:.2%}, "
@@ -294,25 +298,31 @@ class RiskManager:
             return self._reject(signal, "Budget de risque épuisé (risque total ou corrélé au plafond)")
         self.log.info("Risk Manager: risque autorisé = %.2f %s (%.2f%%)%s", account.equity * fraction,
                       self.currency, fraction * 100, f" — {'; '.join(notes)}" if notes else "")
-        quantity = compute_position_size(account.equity, fraction, signal.price, stop,
-                                         lim.qty_step, lim.fee_rate, lim.slippage_rate)
-        unit_cost = signal.price * (1 + lim.fee_rate + lim.slippage_rate)
-        cash_cap = round_down_to_step(max(account.available_cash, 0.0) / unit_cost, lim.qty_step)
-        exposure_cap = round_down_to_step(account.equity * lim.max_position_pct / signal.price,
-                                          lim.qty_step)
+        # Montants du compte = montants en devise de cotation x fx (ex. EUR -> USD).
+        unit_risk = risk_per_unit(signal.price, stop, costs.fee_rate, costs.slippage_rate) * fx
+        quantity = round_down_to_step(account.equity * fraction / unit_risk, costs.qty_step)
+        unit_cost = signal.price * (1 + costs.fee_rate + costs.slippage_rate) * fx
+        cash_cap = round_down_to_step(max(account.available_cash, 0.0) / unit_cost, costs.qty_step)
+        exposure_cap = round_down_to_step(account.equity * lim.max_position_pct / (signal.price * fx),
+                                          costs.qty_step)
         quantity = min(quantity, cash_cap, exposure_cap)
-        if quantity < lim.min_qty:
-            return self._reject(signal, f"Taille {quantity:g} inférieure au minimum {lim.min_qty:g}")
-        if quantity * signal.price < lim.min_notional:
+        if quantity < costs.min_qty:
+            return self._reject(signal, f"Taille {quantity:g} inférieure au minimum {costs.min_qty:g}")
+        if quantity * signal.price < costs.min_notional:
             return self._reject(signal, f"Notionnel {quantity * signal.price:.2f} < minimum "
-                                        f"{lim.min_notional:.2f}")
-        unit_risk = risk_per_unit(signal.price, stop, lim.fee_rate, lim.slippage_rate)
+                                        f"{costs.min_notional:.2f}")
         return RiskDecision(
             approved=True, reason="Risque accepté", quantity=quantity, entry_price=signal.price,
             stop_loss=stop, take_profit=take_profit, stop_distance=abs(signal.price - stop),
             take_profit_distance=abs(take_profit - signal.price), risk_amount=quantity * unit_risk,
             risk_fraction=fraction, notes=tuple(notes),
         )
+
+    def _costs(self, symbol: str) -> tuple[object, float]:
+        if self.specs is not None:
+            return self.specs.costs(symbol), self.specs.fx_rate(symbol)
+        from app.trading.specs import MarketSpecs  # import local : évite un cycle
+        return MarketSpecs(self.limits).costs(symbol), 1.0
 
     def _reject(self, signal: Signal, reason: str) -> RiskDecision:
         self.log.warning("Risk Manager: signal %s %s refusé — %s", signal.direction, signal.symbol, reason)
@@ -391,21 +401,31 @@ class RiskManager:
                 halt_reason: str | None, week_start_equity: float = 0.0) -> None:
         self._day = day
         self._day_start_equity = day_start_equity
+        self._last_equity = self._last_equity or day_start_equity
         if day is not None and week_start_equity:
             self._week = (day.isocalendar()[0], day.isocalendar()[1])
             self._week_start_equity = week_start_equity
         self.halted = halted
         self.halt_reason = halt_reason
 
+    def shift_baselines(self, delta: float) -> None:
+        """Après un dépôt / retrait, décale les références de perte journalière et hebdomadaire."""
+        if self._day_start_equity:
+            self._day_start_equity += delta
+        if self._week_start_equity:
+            self._week_start_equity += delta
+
     def set_exit_params(self, exit_params: ExitParams) -> None:
         self.exit_params = exit_params
 
-    def status(self) -> dict[str, object]:
+    def status(self, equity: float | None = None) -> dict[str, object]:
+        """État des limites ; ``equity`` = equity courante (sinon la dernière reçue)."""
+        current = equity if equity is not None else self._last_equity or None
         return {
             "halted": self.halted,
             "halt_reason": self.halt_reason,
-            "daily_loss": self.daily_loss(),
-            "weekly_loss": self.weekly_loss(),
+            "daily_loss": self.daily_loss(current) if current else 0.0,
+            "weekly_loss": self.weekly_loss(current) if current else 0.0,
             "daily_limit_reached": self._daily_blocked,
             "weekly_limit_reached": self._weekly_blocked,
             "day_start_equity": self._day_start_equity,

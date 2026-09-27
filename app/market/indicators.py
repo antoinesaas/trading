@@ -153,3 +153,63 @@ def swing_levels(high: ArrayLike, low: ArrayLike, lookback: int = 3,
         if len(supports) >= count and len(resistances) >= count:
             break
     return supports, resistances
+
+
+def mfi(high: ArrayLike, low: ArrayLike, close: ArrayLike, volume: ArrayLike, length: int = 14) -> FloatArray:
+    """Money Flow Index : RSI pondéré par le volume (0 à 100)."""
+    typical = (_as_array(high) + _as_array(low) + _as_array(close)) / 3
+    flow = typical * _as_array(volume)
+    change = np.diff(typical, prepend=np.nan)
+    positive = np.where(change > 0, flow, 0.0)
+    negative = np.where(change < 0, flow, 0.0)
+    out = np.full(typical.shape, np.nan)
+    if typical.size > length:
+        window = np.lib.stride_tricks.sliding_window_view
+        pos, neg = window(positive[1:], length).sum(axis=1), window(negative[1:], length).sum(axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            values = 100 - 100 / (1 + pos / neg)
+        out[length:] = np.where(neg == 0, np.where(pos == 0, 50.0, 100.0), values)
+    return out
+
+
+def obv(close: ArrayLike, volume: ArrayLike) -> FloatArray:
+    """On-Balance Volume : volume cumulé signé par la direction de la clôture."""
+    prices, vol = _as_array(close), _as_array(volume)
+    direction = np.sign(np.diff(prices, prepend=prices[:1]))
+    return np.cumsum(direction * vol)
+
+
+def rsi_divergence(close: ArrayLike, rsi_values: ArrayLike, lookback: int = 30) -> str | None:
+    """Divergence entre les deux derniers creux (ou sommets) du prix et du RSI.
+
+    Haussière : prix plus bas mais RSI plus haut ; baissière : prix plus haut mais RSI plus bas.
+    """
+    prices, osc = _as_array(close)[-lookback:], _as_array(rsi_values)[-lookback:]
+    if prices.size < 10 or np.isnan(osc).any():
+        return None
+    lows = [i for i in range(2, prices.size - 2) if prices[i] == prices[i - 2:i + 3].min()]
+    highs = [i for i in range(2, prices.size - 2) if prices[i] == prices[i - 2:i + 3].max()]
+    if len(lows) >= 2 and prices[lows[-1]] < prices[lows[-2]] and osc[lows[-1]] > osc[lows[-2]]:
+        return "haussière"
+    if len(highs) >= 2 and prices[highs[-1]] > prices[highs[-2]] and osc[highs[-1]] < osc[highs[-2]]:
+        return "baissière"
+    return None
+
+
+def zigzag(high: ArrayLike, low: ArrayLike, lookback: int = 3) -> list[tuple[int, float, str]]:
+    """Points pivots alternés (index, prix, 'H' ou 'L') : la structure du marché."""
+    hi, lo = _as_array(high), _as_array(low)
+    points: list[tuple[int, float, str]] = []
+    for i in range(lookback, hi.size - lookback):
+        window = slice(i - lookback, i + lookback + 1)
+        for kind, value, is_pivot in (("H", hi[i], hi[i] == hi[window].max()),
+                                      ("L", lo[i], lo[i] == lo[window].min())):
+            if not is_pivot:
+                continue
+            if points and points[-1][2] == kind:
+                better = value > points[-1][1] if kind == "H" else value < points[-1][1]
+                if better:
+                    points[-1] = (i, float(value), kind)
+                continue
+            points.append((i, float(value), kind))
+    return points

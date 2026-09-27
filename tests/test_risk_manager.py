@@ -132,3 +132,13 @@ def test_trailing_stop_only_moves_in_favour_after_activation():
 def test_limits_are_frozen_dataclass():
     with pytest.raises(AttributeError):
         RiskLimits().risk_per_trade = 0.5  # type: ignore[misc]
+
+
+def test_status_after_restart_does_not_report_a_fake_loss():
+    """Au redémarrage, aucune equity n'a encore été reçue : pas de « perte de 100 % » affichée."""
+    from datetime import date
+
+    rm = RiskManager(zero_cost_limits(), ExitParams())
+    rm.restore(date(2026, 9, 27), 10_000.0, False, None, week_start_equity=10_000.0)
+    assert rm.status()["daily_loss"] == 0.0 and rm.status()["weekly_loss"] == 0.0
+    assert rm.status(9_700.0)["daily_loss"] == 0.03

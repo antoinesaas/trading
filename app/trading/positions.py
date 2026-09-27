@@ -42,6 +42,7 @@ class Position:
     best_price: float = 0.0  # meilleur prix atteint depuis l'entrée (excursion favorable)
     decision_id: int | None = None
     confidence: float | None = None
+    fx_rate: float = 1.0  # devise de cotation -> devise du compte, figé à l'entrée
 
     def __post_init__(self) -> None:
         self.last_price = self.last_price or self.entry_price
@@ -54,15 +55,17 @@ class Position:
 
     @property
     def cost_basis(self) -> float:
-        return self.entry_price * self.quantity
+        """Capital immobilisé, en devise du compte."""
+        return self.entry_price * self.quantity * self.fx_rate
 
     @property
     def initial_risk_per_unit(self) -> float:
         return abs(self.entry_price - self.initial_stop_loss)
 
     def unrealized_pnl(self, price: float | None = None) -> float:
+        """P&L latent en devise du compte."""
         mark = self.last_price if price is None else price
-        return self.direction.sign * (mark - self.entry_price) * self.quantity
+        return self.direction.sign * (mark - self.entry_price) * self.quantity * self.fx_rate
 
     def favorable_move(self, price: float) -> float:
         return self.direction.sign * (price - self.entry_price)

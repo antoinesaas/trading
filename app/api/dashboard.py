@@ -11,21 +11,26 @@ import hmac
 import logging
 import time
 from dataclasses import asdict
+from datetime import timedelta
 from typing import Annotated, Any
+
+import numpy as np
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket, status
 from fastapi.websockets import WebSocketDisconnect
 from pydantic import BaseModel
 
-from app.ai.service import OptimizerBusyError, OptimizerUnavailableError
 from app.backtest.metrics import compute_metrics
 from app.bot.runner import BotStateError
+from app.core.events import EventType
 from app.core.types import to_payload, utcnow
 from app.market.data_provider import MarketDataError
-from app.market.sessions import market_clock
+from app.market.indicators import ema, rsi, swing_levels, zigzag
+from app.market.sessions import market_clock, market_open
+from app.market.universe import instrument
+from app.readiness import evaluate_readiness
 from app.safety import reject_live_mode_request
 from app.services import Services
-from app.strategy import CandleWindow
 
 logger = logging.getLogger(__name__)
 _background: set[asyncio.Task[Any]] = set()
@@ -85,7 +90,7 @@ def build_status(services: Services) -> dict[str, Any]:
         "performance": {k: getattr(perf, k) for k in (
             "trades", "wins", "losses", "win_rate", "avg_win", "avg_loss", "profit_factor",
             "expectancy", "expectancy_r", "fees_paid")},
-        "risk": risk.status() | {"limits": asdict(risk.limits),
+        "risk": risk.status(equity) | {"limits": asdict(risk.limits),
                                  "open_risk": asdict(engine.account().open_risk)},
         "positions": positions,
         "pending_orders": to_payload(engine.broker.pending_orders()),
@@ -94,6 +99,7 @@ def build_status(services: Services) -> dict[str, Any]:
         "ai": {"enabled": services.ai_trader is not None, "mode": s.decision_mode,
                "decision_model": s.ai_decision_model, "review_model": s.ai_review_model,
                "briefing_model": s.ai_briefing_model, "min_confidence": s.ai_min_confidence,
+               "min_confidence_effective": _threshold(services),
                "costs": services.costs.status(),
                "briefing": _briefing_summary(services)},
         "market_clock": market_clock(utcnow()).as_dict(),
@@ -103,6 +109,13 @@ def build_status(services: Services) -> dict[str, Any]:
                       "auto_apply": services.optimizer.auto_apply,
                       "interval_hours": services.optimizer.interval_hours},
     }
+
+
+def _threshold(services: Services) -> dict[str, Any] | None:
+    if services.ai_trader is None:
+        return None
+    value, reason = services.ai_trader.threshold_status()
+    return {"value": value, "reason": reason}
 
 
 def _briefing_summary(services: Services) -> dict[str, Any] | None:
@@ -148,34 +161,88 @@ def get_equity(services: Authed, limit: Annotated[int, Query(ge=1, le=20_000)] =
     return services.repo.equity_curve(limit)
 
 
-@router.get("/candles")
-async def get_candles(services: Authed, symbol: str) -> dict[str, Any]:
-    engine = services.stack.engine
+CHART_TIMEFRAMES = ("1h", "4h", "1d", "1w")
+
+
+@router.get("/chart")
+async def get_chart(services: Authed, symbol: str, timeframe: str = "") -> dict[str, Any]:
+    """Tout ce que le graphique affiche : bougies, volume, EMA, RSI, niveaux, structure, trades, IA."""
     if symbol not in services.settings.symbol_list:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Symbole inconnu : {symbol}")
-    candles, forming = engine.window(symbol), services.runner.forming.get(symbol)
-    if not candles:  # bot arrêté : afficher quand même le marché
-        try:
-            fetched = await asyncio.to_thread(services.provider.fetch_candles, symbol,
-                                              services.settings.timeframe, engine.window_size + 1)
-        except MarketDataError as exc:
-            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
-        candles = [c for c in fetched if c.closed]
-        forming = fetched[-1] if fetched and not fetched[-1].closed else None
-    rows = [{"time": int(c.open_time.timestamp()), "open": c.open, "high": c.high, "low": c.low,
-             "close": c.close} for c in candles]
-    if forming is not None and (not candles or forming.open_time > candles[-1].open_time):
-        rows.append({"time": int(forming.open_time.timestamp()), "open": forming.open,
-                     "high": forming.high, "low": forming.low, "close": forming.close})
-    overlays: dict[str, list[dict[str, float]]] = {}
-    if candles:
-        series = engine.strategy.indicator_series(CandleWindow.from_candles(candles))
-        for name, values in series.items():
-            if name.startswith("ema"):
-                overlays[name] = [{"time": r["time"], "value": float(v)}
-                                  for r, v in zip(rows, values, strict=False) if v == v]
-    return {"symbol": symbol, "timeframe": services.settings.timeframe, "candles": rows,
-            "indicators": overlays, "trades": services.repo.recent_trades(200, symbol=symbol)}
+    timeframe = timeframe or services.settings.timeframe
+    if timeframe not in {*CHART_TIMEFRAMES, services.settings.timeframe}:
+        raise HTTPException(422, f"Timeframe parmi {CHART_TIMEFRAMES}")
+    candles = await _chart_candles(services, symbol, timeframe)
+    spec = instrument(symbol)
+    position = services.stack.portfolio.position(symbol)
+    return {
+        "symbol": symbol, "name": spec.name, "asset_class": spec.asset_class, "currency": spec.currency,
+        "tradingview": spec.tradingview, "timeframe": timeframe,
+        "market_open": market_open(spec.calendar, utcnow()),
+        **chart_payload(candles),
+        "trades": services.repo.recent_trades(300, symbol=symbol),
+        "decisions": [d for d in services.repo.recent_decisions(300) if d["symbol"] == symbol],
+        "position": to_payload(position) if position else None,
+    }
+
+
+async def _chart_candles(services: Services, symbol: str, timeframe: str) -> list[Any]:
+    engine = services.stack.engine
+    if timeframe == services.settings.timeframe and engine.window(symbol):
+        candles = engine.window(symbol)
+        forming = services.runner.forming.get(symbol)
+        if forming is not None and forming.open_time > candles[-1].open_time:
+            candles = [*candles, forming]
+        return candles
+    try:
+        return await asyncio.to_thread(services.provider.fetch_candles, symbol, timeframe, 500)
+    except MarketDataError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+
+
+def chart_payload(candles: list[Any]) -> dict[str, Any]:
+    if not candles:
+        return {"candles": [], "ema_fast": [], "ema_slow": [], "rsi": [], "levels": {"supports": [], "resistances": []},
+                "structure": []}
+    times = [int(c.open_time.timestamp()) for c in candles]
+    close = np.array([c.close for c in candles])
+    high, low = np.array([c.high for c in candles]), np.array([c.low for c in candles])
+
+    def line(values: Any) -> list[dict[str, float]]:
+        return [{"time": t, "value": round(float(v), 8)} for t, v in zip(times, values, strict=True) if v == v]
+
+    recent = slice(-min(len(candles), 200), None)
+    supports, resistances = swing_levels(high[recent], low[recent], lookback=5, count=3)
+    offset = len(candles) - len(high[recent])
+    return {
+        "candles": [{"time": t, "open": c.open, "high": c.high, "low": c.low, "close": c.close, "volume": c.volume}
+                    for t, c in zip(times, candles, strict=True)],
+        "ema_fast": line(ema(close, 20)), "ema_slow": line(ema(close, 50)), "rsi": line(rsi(close, 14)),
+        "levels": {"supports": supports, "resistances": resistances},
+        "structure": [{"time": times[offset + i], "value": price, "kind": kind}
+                      for i, price, kind in zigzag(high[recent], low[recent], lookback=5)],
+    }
+
+
+@router.get("/watchlist")
+async def get_watchlist(services: Authed) -> list[dict[str, Any]]:
+    engine, now = services.stack.engine, utcnow()
+    rows = []
+    for symbol in services.settings.symbol_list:
+        spec = instrument(symbol)
+        window = engine.window(symbol)
+        price = engine.last_price(symbol)
+        cutoff = window[-1].open_time - timedelta(hours=24) if window else now
+        reference = next((c.close for c in reversed(window) if c.open_time <= cutoff), None)
+        position = services.stack.portfolio.position(symbol)
+        analysis = engine.last_analysis(symbol)
+        scores = [v for k, v in (analysis.indicators if analysis else {}).items() if k.startswith("score_")]
+        rows.append({"symbol": symbol, "name": spec.name, "asset_class": spec.asset_class, "price": price,
+                     "change_pct": (price / reference - 1) * 100 if price and reference else None,
+                     "market_open": market_open(spec.calendar, now), "score": max(scores, default=None),
+                     "position": position.direction.value if position else None,
+                     "error": services.runner.symbol_errors.get(symbol)})
+    return rows
 
 
 @router.get("/config")
@@ -286,25 +353,33 @@ def get_optimizer(services: Authed) -> dict[str, Any]:
     return {"runs": services.repo.list_runs(10), "versions": services.repo.list_versions(20)}
 
 
-@router.post("/optimizer/run", status_code=status.HTTP_202_ACCEPTED)
-async def run_optimizer(services: Authed) -> dict[str, Any]:
-    optimizer = services.optimizer
-    if not optimizer.available:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
-                            "Optimiseur IA indisponible : définir ANTHROPIC_API_KEY dans .env")
-    if optimizer.running:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Une optimisation est déjà en cours")
+class CapitalRequest(BaseModel):
+    amount: float
 
-    async def run() -> None:
-        try:
-            await optimizer.run_once("manual")
-        except (OptimizerBusyError, OptimizerUnavailableError) as exc:
-            logger.warning("Optimisation non lancée : %s", exc)
 
-    task = asyncio.create_task(run())
-    _background.add(task)
-    task.add_done_callback(_background.discard)
-    return {"status": "started"}
+@router.post("/account/capital")
+async def set_capital(body: CapitalRequest, services: Authed) -> dict[str, Any]:
+    """Modifie le capital de base (équivalent d'un dépôt ou d'un retrait sur le compte paper)."""
+    if not 10 <= body.amount <= 1_000_000_000:
+        raise HTTPException(422, "Montant entre 10 et 1 000 000 000")
+    stack = services.stack
+    try:
+        delta = stack.portfolio.adjust_capital(body.amount)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    stack.risk.shift_baselines(delta)
+    now = utcnow()
+    services.repo.set_state("initial_capital", body.amount)
+    services.repo.set_state("peak_reset_at", now.isoformat())
+    services.bus.publish(EventType.EQUITY, to_payload(stack.portfolio.snapshot(now)))
+    services.bus.publish(EventType.BOT, {"level": "INFO", "message": f"Capital de base modifié : "
+                                         f"{body.amount:,.2f} (variation {delta:+,.2f})"})
+    return build_status(services)
+
+
+@router.get("/readiness")
+def get_readiness(services: Authed) -> dict[str, Any]:
+    return evaluate_readiness(services)
 
 
 @router.post("/optimizer/versions/{version_id}/activate")

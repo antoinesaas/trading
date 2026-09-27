@@ -26,7 +26,8 @@ def decision(action="OPEN_LONG", confidence=0.8, **entry_overrides):
     if action.startswith("OPEN"):
         entry = EntryPlan(**({"order_type": "MARKET", "limit_price": None, "stop_loss": 98.0, "take_profit": 104.0,
                               "partial_take_profit_price": 102.0, "partial_take_profit_fraction": 0.5,
-                              "breakeven_at_r": 1.0, "time_stop_hours": 24.0, "risk_percent": 1.0}
+                              "breakeven_at_r": 1.0, "time_stop_hours": 24.0, "risk_percent": 1.0,
+                              "horizon": "swing"}
                              | entry_overrides))
     return TradeDecision(action=action, confidence=confidence, market_regime="test", thesis="thèse de test",
                          key_factors=["a"], risks=["b"], invalidation="c", entry=entry, adjustment=None)
@@ -170,3 +171,39 @@ def test_trade_outcome_is_linked_back_to_the_decision(setup):
     assert record["trades_ia_clotures"] == 1
     saved = next(d for d in repo.recent_decisions(5) if d["id"] == decision_id)
     assert saved["outcome_r"] > 1
+
+
+def test_confidence_threshold_rises_when_low_confidence_trades_lose(setup):
+    """Auto-apprentissage : si les trades pris à faible confiance perdent, le seuil monte tout seul."""
+    _, repo, make = setup
+    ai, _ = make(decision())
+    assert ai.min_confidence() == (0.65, "seuil de base")
+
+    def losing(confidence, count):
+        for _ in range(count):
+            decision_id = repo.save_decision(symbol=SYMBOL, trigger="setup", model="test", action="OPEN_LONG",
+                                             status="executed", confidence=confidence)
+            repo.update_decision(decision_id, outcome_r=-0.6)
+
+    losing(0.66, 8)
+    threshold, reason = ai.min_confidence()
+    assert threshold == 0.70 and "<0.70" in reason
+    losing(0.75, 8)
+    assert ai.min_confidence()[0] == 0.80
+    assert ai.threshold_status() == ai.min_confidence()
+
+
+def test_each_closed_trade_produces_a_lesson_reused_in_the_next_decisions(setup):
+    from app.ai.decision import TradeLesson
+
+    stack, repo, make = setup
+    ai, trader = make(decision())
+    trader.lesson = lambda report: TradeLesson(lesson="entrée trop tardive", what_worked="stop",
+                                               what_failed="timing", rule_for_next_time="attendre un repli")
+    decision_id = asyncio.run(ai.evaluate(SYMBOL, "manual"))["id"]
+    now = datetime.now(UTC) + timedelta(hours=4)
+    stack.engine.on_bar_update(Candle(SYMBOL, "4h", now, now + timedelta(hours=4), 100, 105, 99.9, 104.5, 10))
+    trade = stack.portfolio.trades[-1]
+    asyncio.run(ai._learn({"decision_id": decision_id, "symbol": SYMBOL, "r_multiple": trade.r_multiple}))
+    lessons = repo.ai_track_record()["lecons_apprises"]
+    assert lessons and lessons[-1]["regle"] == "attendre un repli"

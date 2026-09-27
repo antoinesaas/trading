@@ -1,9 +1,9 @@
 """Décision de trading par Claude : schéma de sortie structurée et consignes.
 
-Claude choisit l'action (entrer, tenir, ajuster, clôturer), le stop, les objectifs, la
-prise de profit partielle et le pourcentage de capital risqué. Le ``RiskManager`` vérifie
-ensuite chaque chiffre : Claude ne peut ni dépasser le risque maximal, ni élargir un stop,
-ni contourner les limites de compte.
+Claude choisit l'action (entrer, tenir, ajuster, clôturer), l'horizon, le stop, les
+objectifs, la prise de profit partielle et le pourcentage de capital risqué. Le
+``RiskManager`` vérifie ensuite chaque chiffre : Claude ne peut ni dépasser le risque
+maximal, ni élargir un stop, ni contourner les limites de compte.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ class EntryPlan(BaseModel):
     breakeven_at_r: float | None
     time_stop_hours: float | None
     risk_percent: float
+    horizon: Literal["intraday", "swing", "long_terme"]
 
 
 class PositionAdjustment(BaseModel):
@@ -45,43 +46,55 @@ class TradeDecision(BaseModel):
     adjustment: PositionAdjustment | None
 
 
-SYSTEM_PROMPT = """Tu es le gérant de portefeuille d'un bot de trading crypto qui fonctionne en PAPER \
-TRADING (argent simulé, mêmes règles qu'un compte réel). Tu prends les décisions de trading à partir \
-d'un contexte complet : analyse technique multi-timeframe, carnet d'ordres, dérivés, sentiment, \
-sessions de marché, actualités et état du portefeuille.
+class TradeLesson(BaseModel):
+    lesson: str
+    what_worked: str
+    what_failed: str
+    rule_for_next_time: str
 
-Objectif : maximiser l'espérance de gain ajustée du risque et le taux de réussite, en protégeant le \
-capital avant tout. Ne prends que les configurations à forte probabilité, avec plusieurs facteurs \
-concordants. « HOLD » (ne rien faire) est une réponse normale et fréquente : l'absence de trade vaut \
-mieux qu'un trade médiocre. Un taux de réussite élevé ne suffit pas : chaque trade doit avoir une \
-espérance positive une fois les frais (environ 0,2 % aller-retour) payés.
 
-Règles de décision :
-- Entrée (OPEN_LONG / OPEN_SHORT) : place le stop derrière un niveau technique (support, résistance, \
-plus bas / plus haut de swing) et entre 0,5 et 6 ATR du prix actuel. L'objectif final doit offrir \
-au moins 1,5 fois le risque ; vise un niveau technique réaliste. Une prise de profit partielle \
-(partial_take_profit_price, entre l'entrée et l'objectif, fraction 0,3 à 0,6) sécurise le trade : \
-le stop passe alors au point mort. breakeven_at_r (souvent 1) remonte le stop au point mort plus tôt ; \
-time_stop_hours coupe un trade qui ne progresse pas.
-- risk_percent (pourcentage du capital risqué si le stop est touché) : 0,25 à 0,5 pour une \
-conviction modérée, 0,5 à 1 pour une bonne configuration, 1 à 2 seulement pour une configuration \
-exceptionnelle. Réduis-le en cas de drawdown, de série de pertes, de forte incertitude macro ou de \
-liquidité faible. Le système peut encore le réduire, jamais l'augmenter.
-- Ne trade pas contre la tendance du timeframe supérieur sans raison forte. Méfie-toi des entrées \
-juste avant une annonce macro à fort impact, en week-end à faible liquidité, ou quand le funding et \
-le positionnement sont extrêmes (risque de squeeze).
-- Position existante (revue) : HOLD si la thèse tient ; ADJUST pour resserrer le stop (jamais \
-l'élargir) ou déplacer l'objectif ; CLOSE si la thèse est invalidée. Laisse courir les gagnants dont \
-la thèse reste valide.
-- confidence entre 0 et 1 : sois calibré. Ton historique de calibration t'est fourni ; s'il montre \
-que tes trades à confiance donnée gagnent moins que prévu, sois plus exigeant.
-- Tous les prix doivent être cohérents avec le prix actuel du contexte. Remplis entry uniquement \
-pour OPEN_*, adjustment uniquement pour ADJUST ; sinon mets null.
-Rédige thesis, key_factors, risks et invalidation en français, de façon concise."""
+SYSTEM_PROMPT = """Tu es le gérant d'un portefeuille multi-marchés (crypto, actions US, ETF, forex) \
+piloté par un bot en PAPER TRADING (argent simulé, mêmes règles, frais et horaires qu'un compte réel). \
+Tu décides à partir d'un contexte complet : analyse multi-timeframe (tendance, RSI 7/14/21 et \
+divergences, ADX, ATR, MACD, Bollinger), volumes (volume relatif, MFI, OBV), supports et \
+résistances, milieu d'influence de l'actif (indices, VIX, taux US, dollar, secteur), dérivés et \
+carnet d'ordres pour la crypto, sessions et heures d'ouverture, actualités et calendrier économique, \
+portefeuille, et un panorama des autres marchés.
+
+Objectif : le meilleur taux de réussite possible AVEC une espérance positive après frais, en \
+protégeant le capital avant tout. Ne prends que les configurations à forte probabilité, avec plusieurs \
+facteurs concordants (tendance multi-timeframe, momentum RSI, confirmation par le volume, contexte \
+d'influence favorable). « HOLD » est une réponse normale et fréquente. Compare avec le panorama : si \
+une autre opportunité est clairement meilleure, ne gaspille pas ton budget de risque ici.
+
+Règles :
+- Entrée : stop derrière un niveau technique, entre 0,5 et 6 ATR du prix ; objectif final au moins \
+1,5 fois le risque, sur un niveau réaliste. Prise de profit partielle (fraction 0,3 à 0,6) entre \
+l'entrée et l'objectif pour sécuriser : le stop passe alors au point mort.
+- horizon : « intraday » (clôture sous 24 h, time_stop_hours <= 24), « swing » (quelques jours, \
+<= 168 h) ou « long_terme » (tendance de fond hebdomadaire/journalière, jusqu'à 2 160 h, stops plus \
+larges, objectifs plus lointains, risque plus faible). Adapte stop et objectif à l'horizon.
+- risk_percent : 0,25 à 0,5 conviction modérée, 0,5 à 1 bonne configuration, 1 à 2 configuration \
+exceptionnelle seulement. Réduis-le en drawdown, après des pertes, en forte incertitude macro, sur un \
+marché peu liquide ou pour le long terme. Le système peut le réduire, jamais l'augmenter.
+- Volume : un mouvement sans volume est suspect ; une divergence RSI contre ta position est un \
+signal d'alerte. Forex : pas de volume, appuie-toi sur les taux, le dollar et le calendrier.
+- Actions et ETF : tiens compte des résultats d'entreprise à venir et de l'ouverture/clôture de la \
+séance ; évite de porter une position de court terme à travers une publication de résultats.
+- Revue de position : HOLD si la thèse tient, ADJUST pour resserrer le stop (jamais l'élargir) ou \
+déplacer l'objectif, CLOSE si la thèse est invalidée. Laisse courir les gagnants dont la thèse tient.
+- confidence entre 0 et 1, calibrée : ton historique et tes leçons passées te sont fournis ; applique \
+ces leçons et sois plus exigeant là où tu as perdu.
+- Prix cohérents avec le prix actuel. entry uniquement pour OPEN_*, adjustment uniquement pour ADJUST, \
+sinon null. Réponds en français, de façon concise."""
+
+LESSON_PROMPT = """Tu analyses a posteriori un trade clôturé par ton bot de paper trading, pour en \
+tirer une leçon réutilisable. Sois factuel et concis (français) : ce qui a marché, ce qui a échoué, \
+et une règle concrète à appliquer la prochaine fois (conditions de marché précises)."""
 
 
 class ClaudeTrader:
-    """Appelle Claude pour une décision d'entrée ou une revue de position."""
+    """Appelle Claude pour une décision d'entrée, une revue de position ou une leçon."""
 
     def __init__(self, claude: ClaudeClient, *, decision_model: str, decision_effort: str,
                  review_model: str) -> None:
@@ -100,3 +113,10 @@ class ClaudeTrader:
             output_model=TradeDecision, estimate_usd=0.08 if review else 0.25,
         )
         return decision, model
+
+    def lesson(self, trade_report: dict[str, Any]) -> TradeLesson:
+        return self.claude.structured(
+            purpose="leçon", model=self.review_model, effort="low", system=LESSON_PROMPT,
+            user="Trade clôturé (JSON) :\n\n" + json.dumps(trade_report, ensure_ascii=False, default=str),
+            output_model=TradeLesson, estimate_usd=0.03, max_tokens=4_000,
+        )

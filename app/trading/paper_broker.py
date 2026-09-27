@@ -28,6 +28,7 @@ from app.trading.broker import Broker
 from app.trading.orders import IdGenerator, Order, OrderRequest, apply_slippage
 from app.trading.portfolio import Portfolio
 from app.trading.positions import Position
+from app.trading.specs import MarketSpecs
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +43,13 @@ class PaperBroker(Broker):
     is_live: ClassVar[bool] = False
 
     def __init__(self, portfolio: Portfolio, bus: EventBus, limits: RiskLimits,
-                 ids: IdGenerator | None = None, log: logging.Logger | None = None) -> None:
+                 ids: IdGenerator | None = None, log: logging.Logger | None = None,
+                 specs: MarketSpecs | None = None) -> None:
         self.log = log or logger
         self.portfolio = portfolio
         self.bus = bus
         self.limits = limits
+        self.specs = specs or MarketSpecs(limits)
         self.ids = ids or IdGenerator()
         self._pending: list[Order] = []
 
@@ -171,7 +174,7 @@ class PaperBroker(Broker):
 
     def _fill_price(self, order: Order, candle: Candle) -> float | None:
         if order.order_type is OrderType.MARKET:
-            return apply_slippage(candle.open, order.side, self.limits.slippage_rate)
+            return apply_slippage(candle.open, order.side, self.specs.costs(order.symbol).slippage_rate)
         limit = order.limit_price or 0.0
         if order.side is Side.BUY:
             return candle.open if candle.open <= limit else (limit if candle.low <= limit else None)
@@ -181,8 +184,9 @@ class PaperBroker(Broker):
         if self.portfolio.position(order.symbol) is not None:
             self._reject(order, "Position déjà ouverte sur ce symbole")
             return
-        quantity = self._affordable_quantity(order.quantity, price)
-        if quantity < self.limits.min_qty:
+        costs, fx = self.specs.costs(order.symbol), self.specs.fx_rate(order.symbol)
+        quantity = self._affordable_quantity(order.quantity, price, costs.fee_rate, costs.qty_step, fx)
+        if quantity < costs.min_qty:
             self._reject(order, "Fonds insuffisants à l'exécution")
             return
         if quantity < order.quantity:
@@ -191,8 +195,8 @@ class PaperBroker(Broker):
         direction = Direction.LONG if order.side is Side.BUY else Direction.SHORT
         stop = price - direction.sign * (order.stop_distance or 0.0)
         take_profit = price + direction.sign * (order.take_profit_distance or 0.0)
-        fee = quantity * price * self.limits.fee_rate
-        slippage = abs(price - candle.open) * quantity if order.order_type is OrderType.MARKET else 0.0
+        fee = quantity * price * costs.fee_rate * fx
+        slippage = abs(price - candle.open) * quantity * fx if order.order_type is OrderType.MARKET else 0.0
         position_id, position_seq = self.ids.next("POS")
         position = Position(
             id=position_id, seq=position_seq, symbol=order.symbol, direction=direction,
@@ -202,7 +206,7 @@ class PaperBroker(Broker):
             tp1_price=price + direction.sign * order.tp1_distance if order.tp1_distance else None,
             tp1_fraction=order.tp1_fraction, breakeven_at_r=order.breakeven_at_r,
             time_stop_at=fill_time + order.time_stop if order.time_stop else None,
-            decision_id=order.decision_id, confidence=order.confidence,
+            decision_id=order.decision_id, confidence=order.confidence, fx_rate=fx,
         )
         self.portfolio.open_position(position)
         self._mark_filled(order, price, fill_time, fee, slippage, position.id, quantity)
@@ -213,10 +217,10 @@ class PaperBroker(Broker):
         self.log.info("Take Profit = %.8g", take_profit)
         self.bus.publish(EventType.POSITION_OPENED, to_payload(position))
 
-    def _affordable_quantity(self, quantity: float, price: float) -> float:
-        unit_cost = price * (1 + self.limits.fee_rate)
-        affordable = round_down_to_step(max(self.portfolio.available_cash(), 0.0) / unit_cost,
-                                        self.limits.qty_step)
+    def _affordable_quantity(self, quantity: float, price: float, fee_rate: float, qty_step: float,
+                             fx: float) -> float:
+        unit_cost = price * (1 + fee_rate) * fx
+        affordable = round_down_to_step(max(self.portfolio.available_cash(), 0.0) / unit_cost, qty_step)
         return min(quantity, affordable)
 
     def _check_exit(self, candle: Candle) -> None:
@@ -242,14 +246,14 @@ class PaperBroker(Broker):
         Retourne ``False`` si la quantité restante serait trop faible : la position est
         alors clôturée entièrement par l'appelant.
         """
-        lim = self.limits
-        quantity = round_down_to_step(position.initial_quantity * position.tp1_fraction, lim.qty_step)
+        costs = self.specs.costs(position.symbol)
+        quantity = round_down_to_step(position.initial_quantity * position.tp1_fraction, costs.qty_step)
         position.tp1_done = True
-        if quantity < lim.min_qty:
+        if quantity < costs.min_qty:
             return True
-        if position.quantity - quantity < lim.min_qty:
+        if position.quantity - quantity < costs.min_qty:
             return False
-        fee = quantity * price * lim.fee_rate
+        fee = quantity * price * costs.fee_rate * position.fx_rate
         order_id, seq = self.ids.next("PO")
         order = Order(id=order_id, seq=seq, symbol=position.symbol, side=position.direction.exit_side,
                       order_type=OrderType.TAKE_PROFIT_1, intent=OrderIntent.CLOSE, quantity=quantity,
@@ -258,7 +262,7 @@ class PaperBroker(Broker):
         gross = self.portfolio.realize_partial(position.symbol, quantity, price, fee, 0.0)
         self._mark_filled(order, price, when, fee, 0.0, position.id, quantity)
         self._publish_order(order)
-        breakeven = position.entry_price * (1 + position.direction.sign * 2 * lim.fee_rate)
+        breakeven = position.entry_price * (1 + position.direction.sign * 2 * costs.fee_rate)
         if position.direction.sign * (breakeven - position.stop_loss) > 0:
             position.stop_loss = breakeven
             position.breakeven_done, position.stop_reason = True, "Stop au point mort touché"
@@ -270,10 +274,11 @@ class PaperBroker(Broker):
     def _close(self, position: Position, level: float, when: datetime, order_type: OrderType,
                reason: str, order: Order | None = None) -> None:
         side = position.direction.exit_side
+        costs = self.specs.costs(position.symbol)
         slipped = order_type in _SLIPPED_EXITS
-        price = apply_slippage(level, side, self.limits.slippage_rate) if slipped else level
-        fee = position.quantity * price * self.limits.fee_rate
-        slippage = abs(price - level) * position.quantity
+        price = apply_slippage(level, side, costs.slippage_rate) if slipped else level
+        fee = position.quantity * price * costs.fee_rate * position.fx_rate
+        slippage = abs(price - level) * position.quantity * position.fx_rate
         if order is None:
             order_id, seq = self.ids.next("PO")
             order = Order(id=order_id, seq=seq, symbol=position.symbol, side=side, order_type=order_type,

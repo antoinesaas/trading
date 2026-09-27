@@ -20,11 +20,12 @@ from zoneinfo import ZoneInfo
 import holidays
 
 from app.core.types import ensure_utc
+from app.market.universe import instrument
 
 UTC = ZoneInfo("UTC")
 NEW_YORK = ZoneInfo("America/New_York")
 CHICAGO = ZoneInfo("America/Chicago")
-CRYPTO_QUOTES = ("USDT", "USDC", "FDUSD", "BUSD", "BTC", "ETH", "EUR")
+PARIS = ZoneInfo("Europe/Paris")
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,7 @@ class MarketClock:
     cme_btc_futures_open: bool
     liquidity: str  # élevée | normale | faible
     notes: list[str] = field(default_factory=list)
+    markets: dict[str, bool] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -68,12 +70,56 @@ class MarketClock:
             "next_us_open": self.next_us_open.isoformat(), "minutes_to_us_open": self.minutes_to_us_open,
             "minutes_since_us_open": self.minutes_since_us_open,
             "cme_btc_futures_open": self.cme_btc_futures_open, "liquidity": self.liquidity, "notes": self.notes,
+            "markets": self.markets,
         }
 
 
 @lru_cache(maxsize=8)
 def _nyse_holidays(year: int) -> holidays.HolidayBase:
     return holidays.financial_holidays("NYSE", years=[year])
+
+
+@lru_cache(maxsize=8)
+def _euronext_holidays(year: int) -> holidays.HolidayBase:
+    """Euronext Paris ferme les jours fériés TARGET (1er janvier, Vendredi saint, lundi de Pâques,
+    1er mai, 25 et 26 décembre)."""
+    return holidays.financial_holidays("ECB", years=[year])
+
+
+def euronext_open(now: datetime) -> bool:
+    local = ensure_utc(now).astimezone(PARIS)
+    day = local.date()
+    return day.weekday() < 5 and _euronext_holidays(day.year).get(day) is None and time(9) <= local.time() < time(17, 30)
+
+
+def forex_open(now: datetime) -> bool:
+    """Forex : du dimanche 17h au vendredi 17h (heure de New York)."""
+    local = ensure_utc(now).astimezone(NEW_YORK)
+    weekday, t = local.weekday(), local.time()
+    return not (weekday == 5 or (weekday == 6 and t < time(17)) or (weekday == 4 and t >= time(17)))
+
+
+def market_open(calendar: str, now: datetime) -> bool:
+    match calendar:
+        case "nyse":
+            return us_equity_open(now)
+        case "euronext":
+            return euronext_open(now)
+        case "forex":
+            return forex_open(now)
+        case _:
+            return True
+
+
+def next_market_open(calendar: str, now: datetime) -> datetime:
+    """Prochaine ouverture (recherche par pas de 15 minutes, sur 10 jours au plus)."""
+    probe = ensure_utc(now).replace(second=0, microsecond=0)
+    probe += timedelta(minutes=15 - probe.minute % 15)
+    for _ in range(4 * 24 * 10):
+        if market_open(calendar, probe):
+            return probe
+        probe += timedelta(minutes=15)
+    return probe
 
 
 def us_holiday(day: date) -> str | None:
@@ -137,21 +183,27 @@ def market_clock(now: datetime) -> MarketClock:
         next_us_open=upcoming, minutes_to_us_open=None if us_open else minutes_to_open,
         minutes_since_us_open=int((now - session_start).total_seconds() // 60) if us_open else None,
         cme_btc_futures_open=cme_btc_futures_open(now), liquidity=liquidity, notes=notes,
+        markets={"crypto": True, "actions_us": us_open, "euronext": euronext_open(now), "forex": forex_open(now)},
     )
 
 
 def is_crypto(symbol: str) -> bool:
-    return symbol.upper().endswith(CRYPTO_QUOTES)
+    return instrument(symbol).asset_class == "crypto"
+
+
+CALENDAR_LABELS = {"nyse": "Bourse US (NYSE/Nasdaq)", "euronext": "Euronext Paris", "forex": "Forex", "24/7": "Crypto"}
 
 
 def entry_window_block(symbol: str, now: datetime, *, trade_weekends: bool,
                        no_trade_hours_utc: frozenset[int]) -> str | None:
     """Raison de bloquer une nouvelle entrée à cette heure, ou ``None`` si autorisé."""
     now = ensure_utc(now)
-    if not is_crypto(symbol) and not us_equity_open(now):
-        return "Marché actions US fermé"
-    if not trade_weekends and now.weekday() >= 5:
-        return "Trading du week-end désactivé (TRADE_WEEKENDS=false)"
+    calendar = instrument(symbol).calendar
+    if not market_open(calendar, now):
+        opening = next_market_open(calendar, now)
+        return f"{CALENDAR_LABELS[calendar]} fermé (réouverture {opening:%Y-%m-%d %H:%M} UTC)"
+    if calendar == "24/7" and not trade_weekends and now.weekday() >= 5:
+        return "Trading crypto du week-end désactivé (TRADE_WEEKENDS=false)"
     if now.hour in no_trade_hours_utc:
         return f"Heure {now.hour:02d}h UTC exclue (NO_TRADE_HOURS_UTC)"
     return None

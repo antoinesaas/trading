@@ -28,9 +28,11 @@ from app.engine.params import ParameterSet, risk_limits_from_settings
 from app.engine.stack import TradingStack, build_trading_stack
 from app.market.data_provider import BinanceMarketDataProvider, CSVMarketDataProvider, MarketDataProvider
 from app.market.derivatives import BinanceFuturesData, FearGreedIndex
+from app.market.yahoo import FxRates, MultiMarketData, YahooMarketData
 from app.safety import assert_no_live_credentials, assert_paper_only
 from app.trading.orders import IdGenerator
 from app.trading.portfolio import Portfolio
+from app.trading.specs import MarketSpecs
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +53,15 @@ class Services:
     briefing: BriefingService | None = None
 
 
-def create_provider(settings: Settings) -> MarketDataProvider:
+def create_provider(settings: Settings) -> tuple[MarketDataProvider, FxRates | None]:
+    """Source des prix et convertisseur de devises (``live`` : Binance + Yahoo Finance)."""
     if settings.market_data_provider == "csv":
-        return CSVMarketDataProvider(settings.csv_data_dir)
-    return BinanceMarketDataProvider(settings.binance_base_url)
+        return CSVMarketDataProvider(settings.csv_data_dir), None
+    binance = BinanceMarketDataProvider(settings.binance_base_url)
+    if settings.market_data_provider == "binance":
+        return binance, None
+    yahoo = YahooMarketData(settings.yahoo_base_url)
+    return MultiMarketData(binance, yahoo), FxRates(yahoo)
 
 
 def create_advisor(settings: Settings, claude: ClaudeClient | None) -> ParameterAdvisor | None:
@@ -81,15 +88,15 @@ def _create_ai_trader(settings: Settings, services: Services, claude: ClaudeClie
         briefing.latest = MarketBriefing.model_validate(latest)
     context = MarketContextBuilder(
         services.provider, timeframes=settings.context_timeframe_list,
-        futures=BinanceFuturesData(settings.binance_futures_url) if settings.market_data_provider == "binance" else None,
-        fear_greed=FearGreedIndex(settings.fear_greed_url) if settings.market_data_provider == "binance" else None)
+        futures=BinanceFuturesData(settings.binance_futures_url) if settings.market_data_provider != "csv" else None,
+        fear_greed=FearGreedIndex(settings.fear_greed_url) if settings.market_data_provider != "csv" else None)
     trader = ClaudeTrader(claude, decision_model=settings.ai_decision_model,
                           decision_effort=settings.ai_decision_effort, review_model=settings.ai_review_model)
     config = AITraderConfig(
         symbols=settings.symbol_list, timeframe=settings.timeframe, min_confidence=settings.ai_min_confidence,
         min_scan_score=settings.ai_min_scan_score, review_minutes=settings.ai_review_interval_minutes,
         trade_weekends=settings.trade_weekends, no_trade_hours=settings.no_trade_hours,
-        max_spread_pct=settings.max_spread_pct)
+        max_spread_pct=settings.max_spread_pct, max_analyses_per_cycle=settings.ai_max_analyses_per_cycle)
     services.briefing = briefing
     services.ai_trader = AITrader(services.stack.engine, trader, context, repo, bus, config, briefing)
     services.runner.after_tick = services.ai_trader.after_tick
@@ -129,16 +136,19 @@ def build_services(settings: Settings, *, provider: MarketDataProvider | None = 
     ai_mode = settings.ai_decisions_enabled
     if settings.decision_mode == "ai" and not ai_mode:
         logger.warning("DECISION_MODE=ai mais ANTHROPIC_API_KEY absente : décisions par règles.")
+    default_provider, fx = create_provider(settings)
+    provider = provider or default_provider
+    limits = risk_limits_from_settings(settings)
+    specs = MarketSpecs(limits, fx=fx.rate if fx else None, use_universe=True)
     stack = build_trading_stack(
-        _active_params(repo, settings), risk_limits_from_settings(settings), state.initial_capital,
+        _active_params(repo, settings), limits, state.initial_capital,
         bus=bus, portfolio=portfolio, ids=IdGenerator(state.id_counters),
         currency=settings.account_currency, lookback_bars=settings.lookback_bars,
-        internal_signals=settings.signal_source in ("internal", "both"),
+        internal_signals=settings.signal_source in ("internal", "both"), specs=specs,
     )
     stack.engine.auto_execute = not ai_mode
     stack.risk.restore(state.day, state.day_start_equity, state.halted, state.halt_reason,
                        state.week_start_equity)
-    provider = provider or create_provider(settings)
     runner = BotRunner(stack.engine, provider, bus, symbols=settings.symbol_list,
                        timeframe=settings.timeframe, poll_interval=settings.poll_interval_seconds,
                        repository=repo, last_processed=state.last_processed)
@@ -155,7 +165,7 @@ def build_services(settings: Settings, *, provider: MarketDataProvider | None = 
         currency=settings.account_currency,
     ) if advisor is not None else None
     optimizer_service = OptimizerService(
-        optimizer, stack.engine, provider, repo, bus, symbols=settings.symbol_list,
+        optimizer, stack.engine, provider, repo, bus, symbols=settings.ai_optimizer_symbol_list,
         timeframe=settings.timeframe, train_bars=settings.ai_train_bars,
         validation_bars=settings.ai_validation_bars, auto_apply=settings.ai_auto_apply,
         interval_hours=settings.ai_optimizer_interval_hours, scheduled=settings.ai_optimizer_enabled,

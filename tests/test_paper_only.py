@@ -138,7 +138,7 @@ FORBIDDEN = [
 
 
 def test_codebase_contains_no_real_order_code():
-    files = [p for p in (ROOT / "app").rglob("*.py")] + list((ROOT / "dashboard").glob("*.*"))
+    files = list((ROOT / "app").rglob("*.py")) + list((ROOT / "dashboard").glob("*.*"))
     offenders = [f"{path.name}: {pattern}" for path in files for pattern in FORBIDDEN
                  if re.search(pattern, path.read_text(encoding="utf-8"))]
     assert offenders == []

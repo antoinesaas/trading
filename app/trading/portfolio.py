@@ -77,7 +77,7 @@ class Portfolio:
                         slippage: float) -> float:
         """Sortie partielle : encaisse le P&L de ``quantity`` unités ; retourne le P&L brut."""
         position = self.positions[symbol]
-        gross = position.direction.sign * (price - position.entry_price) * quantity
+        gross = position.direction.sign * (price - position.entry_price) * quantity * position.fx_rate
         position.quantity -= quantity
         position.realized_pnl += gross
         position.exit_fees += fee
@@ -97,8 +97,8 @@ class Portfolio:
         self.balance += final_gross - exit_fee
         quantity = position.initial_quantity
         average_exit = (position.exit_notional + exit_price * position.quantity) / quantity
-        initial_risk = position.initial_risk_per_unit * quantity
-        cost = position.entry_price * quantity
+        initial_risk = position.initial_risk_per_unit * quantity * position.fx_rate
+        cost = position.entry_price * quantity * position.fx_rate
         trade = Trade(
             id=trade_id, seq=trade_seq, position_id=position.id, symbol=symbol,
             direction=position.direction, side=position.side, order_type=order_type,
@@ -114,6 +114,18 @@ class Portfolio:
         )
         self.trades.append(trade)
         return trade
+
+    def adjust_capital(self, new_initial: float) -> float:
+        """Modifie le capital de base comme un dépôt / retrait ; retourne la variation."""
+        if new_initial <= 0:
+            raise ValueError("Le capital doit être positif")
+        delta = new_initial - self.initial_capital
+        if self.available_cash() + delta < 0:
+            raise ValueError("Retrait impossible : ce capital est immobilisé par des positions ouvertes")
+        self.initial_capital = new_initial
+        self.balance += delta
+        self.peak_equity += delta
+        return delta
 
     def snapshot(self, timestamp: datetime) -> EquitySnapshot:
         equity = self.equity()

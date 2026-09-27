@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -50,12 +50,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     tasks: list[asyncio.Task[None]] = []
     if services.optimizer.scheduled:
         tasks.append(asyncio.create_task(services.optimizer.schedule_loop(), name="optimizer"))
+    services.runner.start_feed()  # flux de prix permanent : graphiques en direct, stops toujours gérés
     if services.settings.bot_auto_start:
         await services.runner.start()
     try:
         yield
     finally:
-        await services.runner.stop()
+        await services.runner.shutdown()
         for task in tasks:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -78,6 +79,13 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     app.include_router(webhook_router)
     app.include_router(api_router)
     app.include_router(ws_router)
+
+    @app.middleware("http")
+    async def revalidate_dashboard(request: Request, call_next):  # type: ignore[no-untyped-def]
+        response: Response = await call_next(request)
+        if request.url.path.startswith("/dashboard"):
+            response.headers["Cache-Control"] = "no-cache"  # toujours la dernière version de l'interface
+        return response
 
     @app.get("/health", include_in_schema=False)
     def health() -> dict[str, object]:

@@ -105,6 +105,7 @@ class TradingRepository:
                 exit_fees=data.get("exit_fees"), exit_slippage=data.get("exit_slippage"),
                 exit_notional=data.get("exit_notional"), best_price=data.get("best_price"),
                 decision_id=data.get("decision_id"), confidence=data.get("confidence"),
+                fx_rate=data.get("fx_rate"),
             ))
 
     def insert_trade(self, data: dict[str, Any]) -> None:
@@ -148,6 +149,11 @@ class TradingRepository:
         with self.db.session() as s:
             row = s.get(BotStateRow, key)
             return default if row is None else row.value
+
+    @staticmethod
+    def _state_in(session: Any, key: str) -> Any:
+        row = session.get(BotStateRow, key)
+        return None if row is None else row.value
 
     def set_state(self, key: str, value: Any) -> None:
         with self.db.session() as s:
@@ -197,7 +203,9 @@ class TradingRepository:
         with self.db.session() as s:
             realized = s.scalar(select(func.coalesce(func.sum(TradeRow.net_pnl), 0.0))) or 0.0
             open_rows = s.scalars(select(PositionRow).where(PositionRow.status == "OPEN")).all()
-            peak = s.scalar(select(func.max(EquitySnapshotRow.equity)))
+            reset_at = _dt(self._state_in(s, "peak_reset_at")) or datetime(1970, 1, 1, tzinfo=UTC)
+            peak = s.scalar(select(func.max(EquitySnapshotRow.equity))
+                            .where(EquitySnapshotRow.timestamp >= reset_at))
             counters = {
                 "PO": s.scalar(select(func.max(OrderRow.seq))) or 0,
                 "POS": s.scalar(select(func.max(PositionRow.seq))) or 0,
@@ -208,12 +216,14 @@ class TradingRepository:
             today = datetime.now(UTC).date()
             first_today = s.scalar(
                 select(EquitySnapshotRow.equity)
-                .where(EquitySnapshotRow.timestamp >= datetime(today.year, today.month, today.day, tzinfo=UTC))
+                .where(EquitySnapshotRow.timestamp >= max(reset_at, datetime(today.year, today.month, today.day,
+                                                                             tzinfo=UTC)))
                 .order_by(EquitySnapshotRow.id).limit(1))
             monday = today - timedelta(days=today.weekday())
             first_week = s.scalar(
                 select(EquitySnapshotRow.equity)
-                .where(EquitySnapshotRow.timestamp >= datetime(monday.year, monday.month, monday.day, tzinfo=UTC))
+                .where(EquitySnapshotRow.timestamp >= max(reset_at, datetime(monday.year, monday.month, monday.day,
+                                                                             tzinfo=UTC)))
                 .order_by(EquitySnapshotRow.id).limit(1))
         positions = [_position_from_row(r) for r in open_rows]
         # Les sorties partielles des positions ouvertes sont déjà encaissées dans la balance.
@@ -319,8 +329,25 @@ class TradingRepository:
                     "action": r.action, "confiance": r.confidence, "these": (r.thesis or "")[:240],
                     "resultat_r": round(r.outcome_r or 0.0, 2), "sortie": r.outcome_reason}
                    for r in rows[-journal_size:]]
-        return {"trades_ia_clotures": len(rows), "calibration_par_confiance": calibration,
-                "derniers_trades_ia": journal}
+        lessons = [{"symbole": r.symbol, "resultat_r": round(r.outcome_r or 0.0, 2),
+                    "regle": (r.lesson or {}).get("rule_for_next_time"), "lecon": (r.lesson or {}).get("lesson")}
+                   for r in rows if r.lesson][-10:]
+        wins = [r for r in rows if (r.outcome_r or 0) > 0]
+        return {"trades_ia_clotures": len(rows),
+                "taux_reussite_ia": round(len(wins) / len(rows), 3) if rows else None,
+                "calibration_par_confiance": calibration, "derniers_trades_ia": journal,
+                "lecons_apprises": lessons}
+
+    def save_lesson(self, decision_id: int, lesson: dict[str, Any]) -> None:
+        self.update_decision(decision_id, lesson=lesson)
+
+    def decision_details(self, decision_id: int) -> dict[str, Any] | None:
+        with self.db.session() as s:
+            row = s.get(AIDecisionRow, decision_id)
+            if row is None:
+                return None
+            return {"action": row.action, "confiance": row.confidence, "regime": row.market_regime,
+                    "these": row.thesis, "invalidation": row.invalidation, "details": row.details}
 
     def insert_usage(self, record: Any) -> None:
         with self.db.session() as s:
@@ -370,7 +397,7 @@ def _position_from_row(row: PositionRow) -> Position:
         stop_reason=row.stop_reason or "Stop-loss touché", realized_pnl=row.realized_pnl or 0.0,
         exit_fees=row.exit_fees or 0.0, exit_slippage=row.exit_slippage or 0.0,
         exit_notional=row.exit_notional or 0.0, best_price=row.best_price or 0.0,
-        decision_id=row.decision_id, confidence=row.confidence,
+        decision_id=row.decision_id, confidence=row.confidence, fx_rate=row.fx_rate or 1.0,
     )
 
 

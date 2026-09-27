@@ -1,18 +1,18 @@
 <!doctype html>
-<html lang="fr">
+<html lang="fr" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Paper Trading Bot</title>
   <link rel="stylesheet" href="style.css">
-  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.0.8/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <span class="badge">PAPER</span>
       <span class="title">Trading Bot</span>
-      <span class="notice">Simulation uniquement — aucun ordre réel ne peut être envoyé</span>
+      <span class="notice">Prix réels, exécution simulée — aucun ordre réel ne peut être envoyé</span>
     </div>
     <div class="controls">
       <span id="bot-status" class="status">—</span>
@@ -20,108 +20,138 @@
       <button data-action="pause">Pause</button>
       <button data-action="stop">Stop</button>
       <button data-action="reset-halt" id="reset-halt" hidden>Réinitialiser le kill-switch</button>
-      <button id="theme-toggle" class="icon" title="Mode clair / sombre" aria-label="Mode clair / sombre">◐</button>
+      <button id="capital-open" title="Modifier le capital de base">Capital</button>
+      <button id="theme-toggle" title="Mode clair / sombre" aria-label="Mode clair / sombre">◐</button>
       <span id="ws-state" class="ws" title="Connexion temps réel">●</span>
     </div>
   </header>
 
   <main>
     <section class="kpis" aria-label="Indicateurs du compte">
-      <div class="kpi"><span>Capital initial</span><strong id="k-initial">—</strong></div>
+      <div class="kpi"><span>Capital de base</span><strong id="k-initial">—</strong></div>
       <div class="kpi"><span>Balance</span><strong id="k-balance">—</strong></div>
       <div class="kpi"><span>Equity</span><strong id="k-equity">—</strong></div>
       <div class="kpi"><span>P&amp;L</span><strong id="k-pnl">—</strong></div>
       <div class="kpi"><span>P&amp;L %</span><strong id="k-pnl-pct">—</strong></div>
       <div class="kpi"><span>Drawdown</span><strong id="k-dd">—</strong></div>
       <div class="kpi"><span>Trades</span><strong id="k-trades">—</strong></div>
-      <div class="kpi"><span>Win rate</span><strong id="k-winrate">—</strong></div>
+      <div class="kpi"><span>Taux de réussite</span><strong id="k-winrate">—</strong></div>
       <div class="kpi"><span>Profit factor</span><strong id="k-pf">—</strong></div>
+      <div class="kpi"><span>Budget IA du jour</span><strong id="k-budget">—</strong></div>
     </section>
 
-    <div class="layout">
-      <div class="col-main">
-        <section class="panel">
-          <div class="panel-head">
-            <div id="symbol-tabs" class="tabs" role="tablist"></div>
-            <div class="meta"><span id="timeframe">—</span> · <strong id="last-price">—</strong></div>
+    <div class="workspace">
+      <section class="chart-panel">
+        <div class="chart-toolbar">
+          <div class="symbol-info">
+            <strong id="sym-name">—</strong>
+            <span id="sym-tv" class="muted"></span>
+            <span id="sym-market" class="tag">—</span>
+            <strong id="last-price">—</strong>
+            <span id="sym-change"></span>
           </div>
-          <div id="price-chart" class="chart chart-price"></div>
-          <div class="legend"><span class="l-fast">EMA rapide</span><span class="l-slow">EMA lente</span>
-            <span class="l-long">▲ entrée long</span><span class="l-short">▼ entrée short</span>
-            <span>● sortie (vert = gain, rouge = perte)</span></div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head"><h2>Courbe d'equity</h2><span class="meta" id="equity-meta"></span></div>
-          <div id="equity-chart" class="chart chart-equity"></div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head">
-            <div class="tabs" role="tablist">
-              <button class="tab active" data-table="trades">Derniers trades</button>
-              <button class="tab" data-table="signals">Derniers signaux</button>
-              <button class="tab" data-table="decisions">Décisions IA</button>
-              <button class="tab" data-table="events">Journal</button>
-            </div>
+          <div class="seg" id="tf-buttons">
+            <button data-tf="1h">1h</button><button data-tf="4h">4h</button>
+            <button data-tf="1d">1J</button><button data-tf="1w">1S</button>
           </div>
-          <div class="table-wrap"><table id="history-table"></table></div>
-        </section>
-      </div>
-
-      <aside class="col-side">
-        <section class="panel">
-          <div class="panel-head"><h2>Claude — décisions</h2><span class="meta" id="ai-mode">—</span></div>
-          <dl id="ai-live" class="facts"></dl>
-          <div class="row-buttons">
-            <button id="ai-analyze" class="wide">Analyser maintenant</button>
-            <button id="ai-briefing" class="wide">Rafraîchir le briefing</button>
+          <div class="toggles" id="toggles">
+            <button data-toggle="ema">EMA 20/50</button><button data-toggle="volume">Volume</button>
+            <button data-toggle="rsi">RSI</button><button data-toggle="levels">Supports / résistances</button>
+            <button data-toggle="structure">Structure</button><button data-toggle="ai">Décisions IA</button>
           </div>
-          <div id="ai-decisions" class="stack small"></div>
-        </section>
+        </div>
+        <div class="chart-wrap">
+          <div class="ohlc" id="ohlc"></div>
+          <div id="chart" class="chart"></div>
+        </div>
+      </section>
 
-        <section class="panel">
-          <div class="panel-head"><h2>Positions ouvertes</h2></div>
-          <div id="positions" class="stack"><p class="muted">Aucune position.</p></div>
-          <div id="pending" class="stack"></div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head"><h2>Risque</h2></div>
-          <dl id="risk" class="facts"></dl>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head"><h2>Marché et actualités</h2><span class="meta" id="clock-utc">—</span></div>
-          <dl id="clock" class="facts"></dl>
-          <div id="briefing" class="stack small"></div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head"><h2>Optimisation du scanner (Claude)</h2></div>
-          <dl id="ai" class="facts"></dl>
-          <button id="optimize-now" class="wide">Optimiser maintenant</button>
-          <div id="ai-runs" class="stack small"></div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head"><h2>Wallet</h2><span class="meta">lecture seule</span></div>
-          <p class="muted small">Préparation d'une future connexion MetaMask. Aucune transaction n'est
-            demandée ni signée : l'adresse et le solde sont seulement affichés.</p>
-          <button id="wallet-connect" class="wide">Connecter MetaMask (lecture seule)</button>
-          <dl id="wallet" class="facts"></dl>
-        </section>
+      <aside class="watchlist-panel">
+        <div class="panel-head"><h2>Marchés suivis</h2><span class="meta" id="wl-count"></span></div>
+        <div class="watchlist" id="watchlist"></div>
       </aside>
     </div>
+
+    <div class="grid-3">
+      <section class="panel">
+        <div class="panel-head"><h2>Claude — décisions</h2><span class="meta" id="ai-mode">—</span></div>
+        <dl id="ai-live" class="facts"></dl>
+        <div id="ai-decisions" class="stack" style="margin-top:8px"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Positions ouvertes</h2></div>
+        <div id="positions" class="stack"><p class="muted">Aucune position.</p></div>
+        <div id="pending" class="stack"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Risque et limites</h2></div>
+        <dl id="risk" class="facts"></dl>
+      </section>
+    </div>
+
+    <div class="grid-3">
+      <section class="panel">
+        <div class="panel-head"><h2>Marchés et actualités</h2><span class="meta" id="clock-utc">—</span></div>
+        <dl id="clock" class="facts"></dl>
+        <div id="briefing" class="stack" style="margin-top:8px"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Prêt pour l'argent réel ?</h2><span class="verdict" id="ready-verdict">—</span></div>
+        <div id="readiness" class="stack"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Auto-apprentissage</h2><span class="meta">automatique</span></div>
+        <dl id="learning" class="facts"></dl>
+        <div id="lessons" class="stack" style="margin-top:8px"></div>
+      </section>
+    </div>
+
+    <div class="grid-3">
+      <section class="panel" style="grid-column: span 2">
+        <div class="panel-head"><h2>Courbe d'equity</h2><span class="meta" id="equity-meta"></span></div>
+        <div id="equity-chart" class="chart-equity"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Wallet</h2><span class="meta">lecture seule</span></div>
+        <p class="muted small">Préparation d'une future connexion MetaMask : adresse et solde affichés,
+          aucune transaction demandée ni signée.</p>
+        <button id="wallet-connect" class="wide">Connecter MetaMask (lecture seule)</button>
+        <dl id="wallet" class="facts"></dl>
+      </section>
+    </div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-table="trades">Trades</button>
+          <button class="tab" data-table="decisions">Décisions IA</button>
+          <button class="tab" data-table="signals">Signaux</button>
+          <button class="tab" data-table="events">Journal</button>
+        </div>
+      </div>
+      <div class="table-wrap"><table id="history-table"></table></div>
+    </section>
   </main>
 
   <dialog id="login">
     <form method="dialog" id="login-form">
       <h2>Accès au dashboard</h2>
-      <p class="muted small">Saisir le DASHBOARD_TOKEN défini dans le fichier .env.</p>
+      <p class="muted small">Saisir le DASHBOARD_TOKEN défini dans le fichier .env (ou sur Render).</p>
       <input id="token-input" type="password" autocomplete="off" required aria-label="Jeton">
       <p id="login-error" class="error small" hidden>Jeton refusé.</p>
-      <button type="submit" class="wide">Entrer</button>
+      <button type="submit" class="wide primary">Entrer</button>
+    </form>
+  </dialog>
+
+  <dialog id="capital-dialog">
+    <form method="dialog" id="capital-form">
+      <h2>Capital de base</h2>
+      <p class="muted small">Équivaut à un dépôt ou à un retrait sur le compte paper : l'historique et les
+        positions sont conservés, les limites de risque s'adaptent au nouveau montant.</p>
+      <input id="capital-input" type="number" min="10" step="any" required aria-label="Montant">
+      <p id="capital-error" class="error small" hidden></p>
+      <button type="submit" class="wide primary">Appliquer</button>
+      <button type="button" class="wide" id="capital-cancel">Annuler</button>
     </form>
   </dialog>
 

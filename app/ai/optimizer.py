@@ -10,7 +10,9 @@ Procédure pour chaque cycle :
    ``min_improvement``, ne dégrade pas l'entraînement, a assez de trades et respecte
    le drawdown maximal. Sinon, rien ne change.
 
-Score = rendement total (%) - 0,5 x drawdown maximal (%), moyenné sur les symboles.
+Score = rendement total (%) - 0,5 x drawdown maximal (%) + 5 x taux de réussite, moyenné sur
+les symboles : la rentabilité domine, le taux de réussite départage (un taux élevé à espérance
+négative reste rejeté).
 """
 
 from __future__ import annotations
@@ -130,7 +132,7 @@ class StrategyOptimizer:
             metrics = run_backtest(segment, params, self.limits, self.initial_capital,
                                    currency=self.currency, lookback_bars=self.lookback_bars).metrics
             per_symbol[symbol] = asdict(metrics) | {
-                "score": metrics.total_return * 100 - 0.5 * metrics.max_drawdown * 100}
+                "score": metrics.total_return * 100 - 0.5 * metrics.max_drawdown * 100 + 5 * metrics.win_rate}
         return self._aggregate(per_symbol)
 
     @staticmethod

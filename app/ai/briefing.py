@@ -108,11 +108,16 @@ conférence FOMC, PCE, discours majeurs de la Fed) des 36 prochaines heures, de 
 
 
 def briefing_request(symbols: list[str], now: datetime) -> str:
-    return (f"Nous sommes le {now:%Y-%m-%d %H:%M} UTC. Actifs suivis : {', '.join(symbols)}.\n"
-            "Recherche : (1) les actualités crypto et macro des dernières 24 heures qui peuvent faire "
-            "bouger ces actifs (ETF, régulation, piratages, liquidations, flux, décisions de banques "
-            "centrales) ; (2) le calendrier économique US et européen des 36 prochaines heures avec les "
-            "heures UTC ; (3) le sentiment général du marché. Puis appelle submit_briefing.")
+    from app.market.universe import instrument
+    listing = ", ".join(f"{s} ({instrument(s).name}, {instrument(s).asset_class})" for s in symbols)
+    return (f"Nous sommes le {now:%Y-%m-%d %H:%M} UTC. Marchés suivis : {listing}.\n"
+            "Recherche : (1) les actualités des dernières 24 heures qui peuvent faire bouger ces marchés "
+            "(macro, géopolitique, crypto : ETF, régulation, piratages, flux ; actions : guidance, "
+            "résultats, analystes) ; (2) le calendrier économique US, zone euro, Royaume-Uni et Japon des "
+            "36 prochaines heures avec les heures UTC, et les décisions de banques centrales à venir "
+            "(Fed, BCE, BoE, BoJ) ; (3) les dates de publication de résultats des actions suivies dans "
+            "les 14 prochains jours (dans key_events) ; (4) le sentiment général par classe d'actifs. "
+            "Donne un biais pour chaque marché suivi, puis appelle submit_briefing.")
 
 
 class BriefingService:

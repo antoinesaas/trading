@@ -29,11 +29,11 @@ class Settings(BaseSettings):
 
     # --- Capital et risque (limites NON modifiables par l'IA) ------------------
     initial_capital: float = Field(10_000.0, gt=0)
-    account_currency: str = "USDT"
+    account_currency: str = "USD"
     risk_per_trade: float = Field(0.01, gt=0, le=0.05)
     hard_max_risk_per_trade: float = Field(0.02, gt=0, le=0.05)
     min_risk_per_trade: float = Field(0.0025, gt=0, le=0.05)
-    max_open_positions: int = Field(3, ge=1, le=50)
+    max_open_positions: int = Field(5, ge=1, le=50)
     max_portfolio_risk: float = Field(0.05, gt=0, le=0.3)
     max_correlated_risk: float = Field(0.03, gt=0, le=0.3)
     max_daily_loss: float = Field(0.03, gt=0, le=0.5)
@@ -80,15 +80,16 @@ class Settings(BaseSettings):
     atr_length: int = Field(14, ge=2, le=100)
 
     # --- Marché --------------------------------------------------------------
-    symbols: str = "BTCUSDT,ETHUSDT,SOLUSDT"
-    timeframe: str = "4h"
-    context_timeframes: str = "1h,4h,1d"
+    symbols: str = "BTCUSDT,ETHUSDT,SOLUSDT,NVDA,TSLA,NFLX,AAPL,MSFT,SPY,QQQ,CAC40,EURUSD,GBPUSD,USDJPY"
+    timeframe: str = "1h"
+    context_timeframes: str = "1h,4h,1d,1w"
+    yahoo_base_url: str = "https://query1.finance.yahoo.com"
     binance_futures_url: str = "https://fapi.binance.com"
     fear_greed_url: str = "https://api.alternative.me"
-    market_data_provider: Literal["binance", "csv"] = "binance"
+    market_data_provider: Literal["live", "binance", "csv"] = "live"
     binance_base_url: str = "https://data-api.binance.vision"
     csv_data_dir: Path = Path("data")
-    poll_interval_seconds: float = Field(5.0, ge=1, le=3_600)
+    poll_interval_seconds: float = Field(10.0, ge=1, le=3_600)
     lookback_bars: int = Field(300, ge=100, le=1_000)
     signal_source: Literal["internal", "tradingview", "both"] = "internal"
     bot_auto_start: bool = False
@@ -119,13 +120,15 @@ class Settings(BaseSettings):
     ai_briefing_max_searches: int = Field(5, ge=1, le=20)
     ai_min_confidence: float = Field(0.65, ge=0.5, le=0.99)
     ai_min_scan_score: float = Field(50.0, ge=0, le=100)
+    ai_max_analyses_per_cycle: int = Field(2, ge=1, le=10)
     ai_review_interval_minutes: int = Field(120, ge=15, le=1_440)
     ai_daily_budget_usd: float = Field(5.0, ge=0, le=1_000)
     ai_max_calls_per_hour: int = Field(20, ge=1, le=500)
     news_blackout_minutes: int = Field(30, ge=0, le=240)
 
     # --- Optimiseur IA (Claude) ----------------------------------------------
-    ai_optimizer_enabled: bool = False
+    ai_optimizer_enabled: bool = True
+    ai_optimizer_symbols: str = "BTCUSDT,ETHUSDT,SPY,QQQ,NVDA,EURUSD"
     ai_model: str = "claude-opus-5-5"
     ai_effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
     ai_optimizer_interval_hours: float = Field(24.0, ge=1, le=24 * 30)
@@ -168,6 +171,11 @@ class Settings(BaseSettings):
     @property
     def symbol_list(self) -> list[str]:
         return self.symbols.split(",")
+
+    @property
+    def ai_optimizer_symbol_list(self) -> list[str]:
+        wanted = [s.strip().upper() for s in self.ai_optimizer_symbols.split(",") if s.strip()]
+        return [s for s in wanted if s in self.symbol_list] or self.symbol_list[:3]
 
     @property
     def context_timeframe_list(self) -> list[str]:

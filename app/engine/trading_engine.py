@@ -134,10 +134,14 @@ class TradingEngine:
     # -- Flux de bougies ----------------------------------------------------------------
     def warm_up(self, candles: Sequence[Candle]) -> None:
         """Charge l'historique pour les indicateurs, sans trader."""
+        symbols = set()
         for candle in candles:
             if candle.closed and self._append(candle):
                 self._last_price[candle.symbol] = candle.close
                 self.portfolio.update_price(candle.symbol, candle.close)
+                symbols.add(candle.symbol)
+        for symbol in symbols:  # score du scanner disponible dès le démarrage (sans signal ni ordre)
+            self._last_analysis[symbol] = self.strategy.analyze(CandleWindow.from_candles(self._windows[symbol]))
 
     def on_bar_update(self, candle: Candle) -> None:
         self._last_price[candle.symbol] = candle.close
@@ -254,7 +258,7 @@ class TradingEngine:
         position = self.portfolio.position(candle.symbol)
         if position is None:
             return
-        level = breakeven_level(position, candle.close, self.risk.limits.fee_rate)
+        level = breakeven_level(position, candle.close, self.broker.specs.costs(candle.symbol).fee_rate)
         if level is not None:
             self.broker.modify_stop(candle.symbol, level, candle.close_time,
                                     f"+{position.breakeven_at_r:g}R atteint", kind="breakeven")

@@ -83,6 +83,7 @@ class PositionRow(Base):
     best_price: Mapped[float | None] = mapped_column(Float)
     decision_id: Mapped[int | None] = mapped_column(Integer)
     confidence: Mapped[float | None] = mapped_column(Float)
+    fx_rate: Mapped[float | None] = mapped_column(Float)
 
 
 class TradeRow(Base):
@@ -211,6 +212,7 @@ class AIDecisionRow(Base):
     outcome_r: Mapped[float | None] = mapped_column(Float)
     outcome_reason: Mapped[str | None] = mapped_column(Text)
     closed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    lesson: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
 
 
 class AIUsageRow(Base):

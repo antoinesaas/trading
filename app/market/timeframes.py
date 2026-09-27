@@ -15,6 +15,7 @@ TIMEFRAME_SECONDS: dict[str, int] = {
     "8h": 28_800,
     "12h": 43_200,
     "1d": 86_400,
+    "1w": 604_800,
 }
 
 _SECONDS_PER_YEAR = 365 * 24 * 3_600

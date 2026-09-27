@@ -59,12 +59,15 @@ class ReadOnlyHttpClient:
 
     def __init__(self, base_url: str, timeout: float = 10.0,
                  transport: httpx.BaseTransport | None = None,
-                 allowed_paths: frozenset[str] = SPOT_MARKET_PATHS) -> None:
+                 allowed_paths: frozenset[str] = SPOT_MARKET_PATHS,
+                 allowed_prefixes: tuple[str, ...] = (), headers: dict[str, str] | None = None) -> None:
         self.allowed_paths = allowed_paths
-        self._client = httpx.Client(base_url=base_url, timeout=timeout, transport=transport)
+        self.allowed_prefixes = allowed_prefixes
+        self._client = httpx.Client(base_url=base_url, timeout=timeout, transport=transport, headers=headers)
 
     def get(self, path: str, params: dict[str, Any]) -> Any:
-        if path not in self.allowed_paths:
+        allowed = path in self.allowed_paths or (path.startswith(self.allowed_prefixes) and ".." not in path)
+        if not allowed:
             raise LiveTradingDisabledError(f"Requête HTTP vers {path!r} interdite (lecture seule).")
         try:
             response = self._client.get(path, params=params)
