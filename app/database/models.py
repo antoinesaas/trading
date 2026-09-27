@@ -67,6 +67,22 @@ class PositionRow(Base):
     entry_order_id: Mapped[str] = mapped_column(String(32))
     entry_reason: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime)
+    # Colonnes ajoutées en v2 (nullables pour la migration automatique des bases existantes)
+    initial_quantity: Mapped[float | None] = mapped_column(Float)
+    tp1_price: Mapped[float | None] = mapped_column(Float)
+    tp1_fraction: Mapped[float | None] = mapped_column(Float)
+    tp1_done: Mapped[bool | None] = mapped_column(Boolean)
+    breakeven_at_r: Mapped[float | None] = mapped_column(Float)
+    breakeven_done: Mapped[bool | None] = mapped_column(Boolean)
+    time_stop_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    stop_reason: Mapped[str | None] = mapped_column(Text)
+    realized_pnl: Mapped[float | None] = mapped_column(Float)
+    exit_fees: Mapped[float | None] = mapped_column(Float)
+    exit_slippage: Mapped[float | None] = mapped_column(Float)
+    exit_notional: Mapped[float | None] = mapped_column(Float)
+    best_price: Mapped[float | None] = mapped_column(Float)
+    decision_id: Mapped[int | None] = mapped_column(Integer)
+    confidence: Mapped[float | None] = mapped_column(Float)
 
 
 class TradeRow(Base):
@@ -95,6 +111,9 @@ class TradeRow(Base):
     strategy: Mapped[str] = mapped_column(String(64))
     reason: Mapped[str] = mapped_column(Text)
     entry_reason: Mapped[str] = mapped_column(Text, default="")
+    decision_id: Mapped[int | None] = mapped_column(Integer)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    max_favorable_r: Mapped[float | None] = mapped_column(Float)
 
 
 class EquitySnapshotRow(Base):
@@ -166,6 +185,59 @@ class OptimizationRunRow(Base):
     baseline: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
     candidates: Mapped[list[Any] | None] = mapped_column(JsonType)
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class AIDecisionRow(Base):
+    """Journal de chaque décision de Claude, de son exécution et de son résultat."""
+
+    __tablename__ = "ai_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    trigger: Mapped[str] = mapped_column(String(16))
+    model: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(16))
+    confidence: Mapped[float | None] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    status_reason: Mapped[str] = mapped_column(Text, default="")
+    market_regime: Mapped[str] = mapped_column(Text, default="")
+    thesis: Mapped[str] = mapped_column(Text, default="")
+    invalidation: Mapped[str] = mapped_column(Text, default="")
+    details: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
+    context: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
+    order_id: Mapped[str | None] = mapped_column(String(32))
+    outcome_net_pnl: Mapped[float | None] = mapped_column(Float)
+    outcome_r: Mapped[float | None] = mapped_column(Float)
+    outcome_reason: Mapped[str | None] = mapped_column(Text)
+    closed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+
+
+class AIUsageRow(Base):
+    __tablename__ = "ai_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+    purpose: Mapped[str] = mapped_column(String(32))
+    model: Mapped[str] = mapped_column(String(64))
+    input_tokens: Mapped[int] = mapped_column(Integer)
+    output_tokens: Mapped[int] = mapped_column(Integer)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer)
+    cache_write_tokens: Mapped[int] = mapped_column(Integer)
+    web_searches: Mapped[int] = mapped_column(Integer)
+    cost_usd: Mapped[float] = mapped_column(Float)
+
+
+class MarketBriefingRow(Base):
+    __tablename__ = "market_briefings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    generated_at: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+    model: Mapped[str] = mapped_column(String(64))
+    risk_level: Mapped[str] = mapped_column(String(16))
+    sentiment: Mapped[float] = mapped_column(Float)
+    summary: Mapped[str] = mapped_column(Text)
+    data: Mapped[dict[str, Any]] = mapped_column(JsonType)
 
 
 class BotStateRow(Base):

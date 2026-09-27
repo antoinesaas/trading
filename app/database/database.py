@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -47,7 +47,21 @@ class Database:
 
     def create_schema(self) -> None:
         Base.metadata.create_all(self.engine)
+        self._add_missing_columns()
         logger.info("Schéma de base de données prêt (%s)", self.backend)
+
+    def _add_missing_columns(self) -> None:
+        """Migration légère : ajoute les colonnes (nullables) apparues depuis la création des tables."""
+        inspector = inspect(self.engine)
+        with self.engine.begin() as connection:
+            for table in Base.metadata.sorted_tables:
+                existing = {column["name"] for column in inspector.get_columns(table.name)}
+                for column in table.columns:
+                    if column.name in existing:
+                        continue
+                    ddl_type = column.type.compile(dialect=self.engine.dialect)
+                    connection.execute(text(f'ALTER TABLE {table.name} ADD COLUMN {column.name} {ddl_type}'))
+                    logger.warning("Migration : colonne %s.%s ajoutée", table.name, column.name)
 
     @contextmanager
     def session(self) -> Iterator[Session]:

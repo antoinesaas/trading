@@ -22,6 +22,7 @@ from app.backtest.metrics import compute_metrics
 from app.bot.runner import BotStateError
 from app.core.types import to_payload, utcnow
 from app.market.data_provider import MarketDataError
+from app.market.sessions import market_clock
 from app.safety import reject_live_mode_request
 from app.services import Services
 from app.strategy import CandleWindow
@@ -84,17 +85,37 @@ def build_status(services: Services) -> dict[str, Any]:
         "performance": {k: getattr(perf, k) for k in (
             "trades", "wins", "losses", "win_rate", "avg_win", "avg_loss", "profit_factor",
             "expectancy", "expectancy_r", "fees_paid")},
-        "risk": risk.status() | {"limits": asdict(risk.limits)},
+        "risk": risk.status() | {"limits": asdict(risk.limits),
+                                 "open_risk": asdict(engine.account().open_risk)},
         "positions": positions,
         "pending_orders": to_payload(engine.broker.pending_orders()),
         "prices": {sym: engine.last_price(sym) for sym in s.symbol_list},
         "params": engine.current_params().model_dump(mode="json"),
+        "ai": {"enabled": services.ai_trader is not None, "mode": s.decision_mode,
+               "decision_model": s.ai_decision_model, "review_model": s.ai_review_model,
+               "briefing_model": s.ai_briefing_model, "min_confidence": s.ai_min_confidence,
+               "costs": services.costs.status(),
+               "briefing": _briefing_summary(services)},
+        "market_clock": market_clock(utcnow()).as_dict(),
         "optimizer": {"available": services.optimizer.available,
                       "scheduled": services.optimizer.scheduled,
                       "running": services.optimizer.running, "model": services.optimizer.model_name,
                       "auto_apply": services.optimizer.auto_apply,
                       "interval_hours": services.optimizer.interval_hours},
     }
+
+
+def _briefing_summary(services: Services) -> dict[str, Any] | None:
+    briefing = services.briefing.latest if services.briefing else None
+    if briefing is None:
+        return None
+    blackout = briefing.active_blackout(utcnow())
+    return {"generated_at": briefing.generated_at.isoformat(), "risk_level": briefing.risk_level,
+            "sentiment": briefing.overall_sentiment, "summary": briefing.summary,
+            "events": [e.model_dump() for e in briefing.key_events],
+            "per_symbol": [v.model_dump() for v in briefing.per_symbol],
+            "blackout": blackout.model_dump(mode="json") if blackout else None,
+            "blackouts": [w.model_dump(mode="json") for w in briefing.blackout_windows]}
 
 
 @router.get("/status")
@@ -223,6 +244,39 @@ def set_mode(request_body: ModeRequest, services: Authed) -> dict[str, Any]:
                                                            f"{request_body.mode!r} bloquée")
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(error))
     return {"mode": "paper"}
+
+
+# --- Décisions de Claude -------------------------------------------------------------------
+
+@router.get("/ai/decisions")
+def get_ai_decisions(services: Authed, limit: Annotated[int, Query(ge=1, le=500)] = 30) -> dict[str, Any]:
+    return {"decisions": services.repo.recent_decisions(limit), "track_record": services.repo.ai_track_record()}
+
+
+def _require_ai(services: Services) -> Any:
+    if services.ai_trader is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Mode IA inactif : définir ANTHROPIC_API_KEY et DECISION_MODE=ai")
+    return services.ai_trader
+
+
+@router.post("/ai/analyze/{symbol}", status_code=status.HTTP_202_ACCEPTED)
+async def analyze_now(symbol: str, services: Authed) -> dict[str, Any]:
+    trader = _require_ai(services)
+    if symbol not in services.settings.symbol_list:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Symbole inconnu : {symbol}")
+    if not services.runner.is_running:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Démarrez le bot avant de demander une analyse")
+    has_position = services.stack.portfolio.position(symbol) is not None
+    trader.spawn(trader.review(symbol, "manual") if has_position else trader.evaluate(symbol, "manual"))
+    return {"status": "started", "kind": "review" if has_position else "entry"}
+
+
+@router.post("/ai/briefing", status_code=status.HTTP_202_ACCEPTED)
+async def refresh_briefing(services: Authed) -> dict[str, Any]:
+    trader = _require_ai(services)
+    trader.spawn(trader.refresh_briefing())
+    return {"status": "started"}
 
 
 # --- Optimiseur IA -------------------------------------------------------------------------

@@ -20,7 +20,7 @@
       <button data-action="pause">Pause</button>
       <button data-action="stop">Stop</button>
       <button data-action="reset-halt" id="reset-halt" hidden>Réinitialiser le kill-switch</button>
-      <button id="theme-toggle" class="icon" title="Inverser noir / blanc" aria-label="Inverser noir / blanc">◐</button>
+      <button id="theme-toggle" class="icon" title="Mode clair / sombre" aria-label="Mode clair / sombre">◐</button>
       <span id="ws-state" class="ws" title="Connexion temps réel">●</span>
     </div>
   </header>
@@ -47,7 +47,8 @@
           </div>
           <div id="price-chart" class="chart chart-price"></div>
           <div class="legend"><span class="l-fast">EMA rapide</span><span class="l-slow">EMA lente</span>
-            <span>▲ entrée long · ▼ entrée short · ● sortie</span></div>
+            <span class="l-long">▲ entrée long</span><span class="l-short">▼ entrée short</span>
+            <span>● sortie (vert = gain, rouge = perte)</span></div>
         </section>
 
         <section class="panel">
@@ -60,6 +61,7 @@
             <div class="tabs" role="tablist">
               <button class="tab active" data-table="trades">Derniers trades</button>
               <button class="tab" data-table="signals">Derniers signaux</button>
+              <button class="tab" data-table="decisions">Décisions IA</button>
               <button class="tab" data-table="events">Journal</button>
             </div>
           </div>
@@ -68,6 +70,16 @@
       </div>
 
       <aside class="col-side">
+        <section class="panel">
+          <div class="panel-head"><h2>Claude — décisions</h2><span class="meta" id="ai-mode">—</span></div>
+          <dl id="ai-live" class="facts"></dl>
+          <div class="row-buttons">
+            <button id="ai-analyze" class="wide">Analyser maintenant</button>
+            <button id="ai-briefing" class="wide">Rafraîchir le briefing</button>
+          </div>
+          <div id="ai-decisions" class="stack small"></div>
+        </section>
+
         <section class="panel">
           <div class="panel-head"><h2>Positions ouvertes</h2></div>
           <div id="positions" class="stack"><p class="muted">Aucune position.</p></div>
@@ -80,7 +92,13 @@
         </section>
 
         <section class="panel">
-          <div class="panel-head"><h2>Amélioration continue (Claude)</h2></div>
+          <div class="panel-head"><h2>Marché et actualités</h2><span class="meta" id="clock-utc">—</span></div>
+          <dl id="clock" class="facts"></dl>
+          <div id="briefing" class="stack small"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><h2>Optimisation du scanner (Claude)</h2></div>
           <dl id="ai" class="facts"></dl>
           <button id="optimize-now" class="wide">Optimiser maintenant</button>
           <div id="ai-runs" class="stack small"></div>

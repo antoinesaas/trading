@@ -1,11 +1,57 @@
 -- Schéma du bot de paper trading pour Supabase (PostgreSQL).
 -- Généré depuis app/database/models.py (SQLAlchemy) : garder les deux synchronisés.
--- À exécuter une fois dans Supabase > SQL Editor (ou `supabase db push`).
+-- Idempotent : peut être rejoué sans risque. Au démarrage, le bot ajoute aussi lui-même
+-- les colonnes manquantes (migration légère).
 --
 -- Sécurité : RLS est activé SANS politique sur chaque table. Les clés publiques
 -- (anon / publishable) n'ont donc aucun accès via l'API REST ; seul le bot, connecté
 -- en direct à PostgreSQL avec DATABASE_URL, lit et écrit ces tables.
 
+
+CREATE TABLE IF NOT EXISTS ai_decisions (
+    id SERIAL NOT NULL, 
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL, 
+    symbol VARCHAR(32) NOT NULL, 
+    trigger VARCHAR(16) NOT NULL, 
+    model VARCHAR(64) NOT NULL, 
+    action VARCHAR(16) NOT NULL, 
+    confidence FLOAT, 
+    status VARCHAR(16) NOT NULL, 
+    status_reason TEXT NOT NULL, 
+    market_regime TEXT NOT NULL, 
+    thesis TEXT NOT NULL, 
+    invalidation TEXT NOT NULL, 
+    details JSONB, 
+    context JSONB, 
+    order_id VARCHAR(32), 
+    outcome_net_pnl FLOAT, 
+    outcome_r FLOAT, 
+    outcome_reason TEXT, 
+    closed_at TIMESTAMP WITH TIME ZONE, 
+    PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_ai_decisions_status ON ai_decisions (status);
+
+CREATE INDEX IF NOT EXISTS ix_ai_decisions_symbol ON ai_decisions (symbol);
+
+CREATE INDEX IF NOT EXISTS ix_ai_decisions_timestamp ON ai_decisions (timestamp);
+
+CREATE TABLE IF NOT EXISTS ai_usage (
+    id SERIAL NOT NULL, 
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL, 
+    purpose VARCHAR(32) NOT NULL, 
+    model VARCHAR(64) NOT NULL, 
+    input_tokens INTEGER NOT NULL, 
+    output_tokens INTEGER NOT NULL, 
+    cache_read_tokens INTEGER NOT NULL, 
+    cache_write_tokens INTEGER NOT NULL, 
+    web_searches INTEGER NOT NULL, 
+    cost_usd FLOAT NOT NULL, 
+    PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_ai_usage_timestamp ON ai_usage (timestamp);
 
 CREATE TABLE IF NOT EXISTS bot_events (
     id SERIAL NOT NULL, 
@@ -41,6 +87,19 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS ix_equity_snapshots_timestamp ON equity_snapshots (timestamp);
+
+CREATE TABLE IF NOT EXISTS market_briefings (
+    id SERIAL NOT NULL, 
+    generated_at TIMESTAMP WITH TIME ZONE NOT NULL, 
+    model VARCHAR(64) NOT NULL, 
+    risk_level VARCHAR(16) NOT NULL, 
+    sentiment FLOAT NOT NULL, 
+    summary TEXT NOT NULL, 
+    data JSONB NOT NULL, 
+    PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_market_briefings_generated_at ON market_briefings (generated_at);
 
 CREATE TABLE IF NOT EXISTS optimization_runs (
     id SERIAL NOT NULL, 
@@ -111,6 +170,21 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_order_id VARCHAR(32) NOT NULL, 
     entry_reason TEXT NOT NULL, 
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL, 
+    initial_quantity FLOAT, 
+    tp1_price FLOAT, 
+    tp1_fraction FLOAT, 
+    tp1_done BOOLEAN, 
+    breakeven_at_r FLOAT, 
+    breakeven_done BOOLEAN, 
+    time_stop_at TIMESTAMP WITH TIME ZONE, 
+    stop_reason TEXT, 
+    realized_pnl FLOAT, 
+    exit_fees FLOAT, 
+    exit_slippage FLOAT, 
+    exit_notional FLOAT, 
+    best_price FLOAT, 
+    decision_id INTEGER, 
+    confidence FLOAT, 
     PRIMARY KEY (id)
 );
 
@@ -179,6 +253,9 @@ CREATE TABLE IF NOT EXISTS trades (
     strategy VARCHAR(64) NOT NULL, 
     reason TEXT NOT NULL, 
     entry_reason TEXT NOT NULL, 
+    decision_id INTEGER, 
+    confidence FLOAT, 
+    max_favorable_r FLOAT, 
     PRIMARY KEY (id)
 );
 
@@ -188,9 +265,12 @@ CREATE INDEX IF NOT EXISTS ix_trades_symbol ON trades (symbol);
 
 CREATE INDEX IF NOT EXISTS ix_trades_timestamp ON trades (timestamp);
 
+ALTER TABLE ai_decisions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_usage ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bot_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bot_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE equity_snapshots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE market_briefings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE optimization_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE positions ENABLE ROW LEVEL SECURITY;

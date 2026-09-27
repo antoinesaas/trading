@@ -17,7 +17,8 @@ from app.risk.risk_manager import RiskLimits
 from app.strategy import EmaRsiParams
 
 DEFAULT_EXITS = {"stop_loss_atr_multiplier": 2.0, "take_profit_risk_reward": 2.0, "trailing_stop_enabled": False,
-                 "trailing_stop_atr_multiplier": 2.0, "trailing_activation_r": 1.0}
+                 "trailing_stop_atr_multiplier": 2.0, "trailing_activation_r": 1.0, "partial_take_profit_r": 0.0,
+                 "partial_take_profit_fraction": 0.5, "breakeven_at_r": 0.0, "time_stop_bars": 0}
 DEFAULT_STRATEGY = {"ema_fast": 20, "ema_slow": 50, "rsi_length": 14, "rsi_long_threshold": 50.0,
                     "rsi_short_threshold": 50.0, "atr_length": 14}
 

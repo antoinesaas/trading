@@ -5,7 +5,7 @@
 
 (() => {
   const TOKEN_KEY = "ptb.token";
-  const THEME_KEY = "ptb.theme";
+  const THEME_KEY = "ptb.theme.v2";
   const store = {
     get(key) { try { return localStorage.getItem(key); } catch { return null; } },
     set(key, value) { try { localStorage.setItem(key, value); } catch { /* stockage indisponible */ } },
@@ -57,24 +57,35 @@
   let priceChart, candleSeries, emaFastSeries, emaSlowSeries, equityChart, equitySeries;
 
   function chartOptions() {
-    const fg = cssVar("--fg"), bg = cssVar("--bg"), soft = cssVar("--soft"), muted = cssVar("--muted");
+    const panel = cssVar("--panel"), soft = cssVar("--soft"), muted = cssVar("--muted"), line = cssVar("--line");
+    const accent = cssVar("--accent");
     return {
       autoSize: true,
-      layout: { background: { type: "solid", color: bg }, textColor: fg, fontFamily: cssVar("--mono") },
+      layout: { background: { type: "solid", color: panel }, textColor: muted, fontFamily: cssVar("--mono") },
       grid: { vertLines: { color: soft }, horzLines: { color: soft } },
-      rightPriceScale: { borderColor: fg },
-      timeScale: { borderColor: fg, timeVisible: true, secondsVisible: false },
+      rightPriceScale: { borderColor: line },
+      timeScale: { borderColor: line, timeVisible: true, secondsVisible: false },
       crosshair: {
         mode: LightweightCharts.CrosshairMode.Normal,
-        vertLine: { color: muted, labelBackgroundColor: fg },
-        horzLine: { color: muted, labelBackgroundColor: fg },
+        vertLine: { color: muted, labelBackgroundColor: accent },
+        horzLine: { color: muted, labelBackgroundColor: accent },
       },
     };
   }
 
   function candleColors() {
-    const fg = cssVar("--fg"), bg = cssVar("--bg");
-    return { upColor: bg, downColor: fg, borderUpColor: fg, borderDownColor: fg, wickUpColor: fg, wickDownColor: fg };
+    const up = cssVar("--up"), down = cssVar("--down");
+    return { upColor: up, downColor: down, borderUpColor: up, borderDownColor: down, wickUpColor: up, wickDownColor: down };
+  }
+
+  function withAlpha(hex, alpha) {
+    const value = parseInt(hex.replace("#", ""), 16);
+    return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`;
+  }
+
+  function equityColors() {
+    const up = cssVar("--up");
+    return { lineColor: up, topColor: withAlpha(up, 0.35), bottomColor: withAlpha(up, 0.02) };
   }
 
   function initCharts() {
@@ -85,13 +96,10 @@
     const line = { lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false };
     priceChart = LightweightCharts.createChart($("price-chart"), chartOptions());
     candleSeries = priceChart.addCandlestickSeries(candleColors());
-    emaFastSeries = priceChart.addLineSeries({ ...line, color: cssVar("--fg") });
-    emaSlowSeries = priceChart.addLineSeries({ ...line, color: cssVar("--muted"), lineStyle: LightweightCharts.LineStyle.Dashed });
+    emaFastSeries = priceChart.addLineSeries({ ...line, color: cssVar("--accent") });
+    emaSlowSeries = priceChart.addLineSeries({ ...line, color: cssVar("--accent-2"), lineStyle: LightweightCharts.LineStyle.Dashed });
     equityChart = LightweightCharts.createChart($("equity-chart"), chartOptions());
-    equitySeries = equityChart.addAreaSeries({
-      lineColor: cssVar("--fg"), lineWidth: 2, priceLineVisible: false,
-      topColor: "rgba(128,128,128,0.28)", bottomColor: "rgba(128,128,128,0.02)",
-    });
+    equitySeries = equityChart.addAreaSeries({ ...equityColors(), lineWidth: 2, priceLineVisible: false });
   }
 
   function applyTheme(theme) {
@@ -101,9 +109,9 @@
     priceChart.applyOptions(chartOptions());
     equityChart.applyOptions(chartOptions());
     candleSeries.applyOptions(candleColors());
-    emaFastSeries.applyOptions({ color: cssVar("--fg") });
-    emaSlowSeries.applyOptions({ color: cssVar("--muted") });
-    equitySeries.applyOptions({ lineColor: cssVar("--fg") });
+    emaFastSeries.applyOptions({ color: cssVar("--accent") });
+    emaSlowSeries.applyOptions({ color: cssVar("--accent-2") });
+    equitySeries.applyOptions(equityColors());
     setMarkers();
     state.priceLineKey = "";
     updatePriceLines();
@@ -134,13 +142,13 @@
 
   function setMarkers() {
     if (!candleSeries) return;
-    const fg = cssVar("--fg");
-    const entry = (time, long) => ({ time, position: long ? "belowBar" : "aboveBar", color: fg, shape: long ? "arrowUp" : "arrowDown", text: long ? "L" : "S" });
+    const up = cssVar("--up"), down = cssVar("--down");
+    const entry = (time, long) => ({ time, position: long ? "belowBar" : "aboveBar", color: long ? up : down, shape: long ? "arrowUp" : "arrowDown", text: long ? "L" : "S" });
     const markers = [];
     for (const t of state.symbolTrades) {
       const long = t.direction === "LONG";
       markers.push(entry(toSec(t.entry_time), long));
-      markers.push({ time: toSec(t.timestamp), position: long ? "aboveBar" : "belowBar", color: fg, shape: "circle", text: fmtSigned(t.net_pnl, 0) });
+      markers.push({ time: toSec(t.timestamp), position: long ? "aboveBar" : "belowBar", color: t.net_pnl >= 0 ? up : down, shape: "circle", text: fmtSigned(t.net_pnl, 0) });
     }
     const p = openPosition();
     if (p) markers.push(entry(toSec(p.entry_time), p.direction === "LONG"));
@@ -151,7 +159,7 @@
   function updatePriceLines() {
     if (!candleSeries) return;
     const p = openPosition();
-    const key = p ? [p.id, p.stop_loss, p.take_profit].join("|") : "";
+    const key = p ? [p.id, p.stop_loss, p.take_profit, p.tp1_done].join("|") : "";
     if (key === state.priceLineKey) return;
     state.priceLineKey = key;
     state.priceLines.forEach((line) => candleSeries.removePriceLine(line));
@@ -160,9 +168,10 @@
     const style = LightweightCharts.LineStyle;
     const add = (price, title, lineStyle, color) => state.priceLines.push(
       candleSeries.createPriceLine({ price, title, lineStyle, color, lineWidth: 1, axisLabelVisible: true }));
-    add(p.entry_price, "Entrée", style.Solid, cssVar("--fg"));
-    add(p.stop_loss, p.trailing_active ? "Trailing SL" : "SL", style.Dashed, cssVar("--fg"));
-    add(p.take_profit, "TP", style.Dotted, cssVar("--muted"));
+    add(p.entry_price, "Entrée", style.Solid, cssVar("--accent"));
+    add(p.stop_loss, p.trailing_active ? "Trailing SL" : "SL", style.Dashed, cssVar("--down"));
+    add(p.take_profit, "TP", style.Dashed, cssVar("--up"));
+    if (p.tp1_price && !p.tp1_done) add(p.tp1_price, "TP1", style.Dotted, cssVar("--violet"));
     setMarkers();
   }
 
@@ -218,7 +227,7 @@
     }
     const status = s.bot.status;
     $("bot-status").textContent = status;
-    $("bot-status").className = "status" + (status === "RUNNING" ? " running" : "");
+    $("bot-status").className = "status" + (status === "RUNNING" ? " running" : status === "HALTED" ? " halted" : "");
     document.querySelector('[data-action="start"]').disabled = status === "RUNNING" || status === "HALTED";
     document.querySelector('[data-action="pause"]').disabled = status !== "RUNNING";
     document.querySelector('[data-action="stop"]').disabled = status === "STOPPED";
@@ -239,17 +248,66 @@
     renderPositions(s);
     renderRisk(s);
     renderAI(s);
+    renderClaude(s);
+    renderClock(s);
     updatePriceLines();
+  }
+
+  function renderClaude(s) {
+    const ai = s.ai;
+    $("ai-mode").textContent = ai.enabled ? "mode IA actif" : `mode ${ai.mode === "ai" ? "IA inactif (clé absente)" : "règles"}`;
+    const c = ai.costs;
+    facts("ai-live", [
+      ["Décisions", ai.enabled ? ai.decision_model : "désactivées"],
+      ["Revues / actualités", `${ai.review_model} / ${ai.briefing_model}`],
+      ["Confiance minimale", fmtNum(ai.min_confidence, 2)],
+      ["Budget API du jour", `${fmtNum(c.spent_today_usd, 2)} / ${fmtNum(c.daily_budget_usd, 2)} $`],
+    ]);
+    $("ai-analyze").disabled = !ai.enabled || s.bot.status !== "RUNNING";
+    $("ai-briefing").disabled = !ai.enabled;
+  }
+
+  function renderClock(s) {
+    const m = s.market_clock, b = s.ai.briefing;
+    $("clock-utc").textContent = new Date(m.utc).toISOString().slice(11, 16) + " UTC";
+    facts("clock", [
+      ["Sessions ouvertes", m.active_sessions.join(", ") || "aucune"],
+      ["Liquidité", m.liquidity],
+      ["Wall Street", m.us_equity_open ? `ouverte (${m.minutes_since_us_open} min)` : `fermée — ouverture ${fmtTime(m.next_us_open)}`],
+      ["Jour férié US", m.us_holiday || "non"],
+      ["Future BTC CME", m.cme_btc_futures_open ? "ouvert" : "fermé"],
+      ["Blackout d'annonce", b && b.blackout ? b.blackout.reason : "aucun"],
+    ]);
+    if (!b) {
+      $("briefing").innerHTML = '<p class="muted">Aucun briefing pour le moment.</p>';
+      return;
+    }
+    const events = b.events.map((e) => `<div class="row"><span>${e.time_utc ? fmtTime(e.time_utc) : "—"} ${esc(e.name)}</span><span class="tag impact-${esc(e.impact)}">${esc(e.impact)}</span></div>`).join("");
+    const views = b.per_symbol.map((v) => `<span class="tag bias-${esc(v.bias)}">${esc(v.symbol)} ${esc(v.bias)}</span>`).join(" ");
+    $("briefing").innerHTML = `<div class="card"><div class="row head"><span>Briefing ${fmtTime(b.generated_at)}</span>
+      <span>risque ${esc(b.risk_level)} · sentiment ${fmtSigned(b.sentiment, 2)}</span></div>
+      <div>${views}</div>${events}<details><summary>Synthèse</summary><p>${esc(b.summary)}</p></details></div>`;
+  }
+
+  async function loadDecisions() {
+    const data = await api("/api/ai/decisions?limit=8");
+    $("ai-decisions").innerHTML = data.decisions.map((d) => `<div class="card">
+      <div class="row head"><span>${esc(d.symbol)} ${esc(d.action)}${d.confidence != null ? ` · ${fmtNum(d.confidence, 2)}` : ""}</span>
+      <span class="tag status-${esc(d.status)}">${esc(d.status)}</span></div>
+      <div class="row muted"><span>${fmtTime(d.timestamp)} · ${esc(d.trigger)}</span><span class="${signClass(d.outcome_r)}">${d.outcome_r != null ? fmtSigned(d.outcome_r, 2) + " R" : ""}</span></div>
+      <p>${esc(d.thesis || d.status_reason)}</p></div>`).join("") || '<p class="muted small">Aucune décision pour le moment.</p>';
   }
 
   function renderPositions(s) {
     const cur = s.account.currency;
     $("positions").innerHTML = s.positions.length ? s.positions.map((p) => `
-      <div class="card">
+      <div class="card ${p.direction === "LONG" ? "long" : "short"}">
         <div class="row head"><span>${esc(p.symbol)} ${esc(p.direction)}</span>
           <span class="${signClass(p.unrealized_pnl)}">${p.unrealized_pnl >= 0 ? "▲" : "▼"} ${fmtSigned(p.unrealized_pnl)} ${esc(cur)} (${fmtPct(p.unrealized_pct, true)})</span></div>
         <div class="row"><span>Qté ${fmtNum(p.quantity, 4)}</span><span>Entrée ${fmtPrice(p.entry_price)}</span></div>
         <div class="row"><span>${p.trailing_active ? "Trailing SL" : "SL"} ${fmtPrice(p.stop_loss)}</span><span>TP ${fmtPrice(p.take_profit)}</span></div>
+        ${p.tp1_price ? `<div class="row"><span>TP1 ${fmtPrice(p.tp1_price)} (${fmtNum(p.tp1_fraction * 100, 0)} %)</span><span>${p.tp1_done ? "encaissé" : p.breakeven_done ? "point mort" : "en attente"}</span></div>` : ""}
+        ${p.confidence != null ? `<div class="row muted"><span>Décision Claude #${p.decision_id}</span><span>confiance ${fmtNum(p.confidence, 2)}</span></div>` : ""}
         <div class="row muted"><span>Dernier ${fmtPrice(p.last_price)}</span><span>${fmtTime(p.entry_time)}</span></div>
       </div>`).join("") : '<p class="muted">Aucune position.</p>';
     $("pending").innerHTML = s.pending_orders.map((o) =>
@@ -266,8 +324,10 @@
       ["Kill-switch", r.halted ? `ACTIF — ${r.halt_reason}` : "inactif"],
       ["Nouvelles entrées", r.entries_blocked ? `bloquées` : "autorisées"],
       ["Perte du jour", `${fmtPct(r.daily_loss)} / ${fmtPct(l.max_daily_loss)}`],
+      ["Perte de la semaine", `${fmtPct(r.weekly_loss)} / ${fmtPct(l.max_weekly_loss)}`],
+      ["Risque ouvert", `${fmtPct(r.open_risk.total)} / ${fmtPct(l.max_portfolio_risk)}`],
+      ["Risque max par trade", fmtPct(l.hard_max_risk_per_trade)],
       ["Drawdown", `${fmtPct(s.account.drawdown)} / ${fmtPct(l.max_drawdown)}`],
-      ["Risque par trade", fmtPct(l.risk_per_trade)],
       ["Positions max", String(l.max_open_positions)],
       ["Frais / slippage", `${fmtPct(l.fee_rate)} / ${fmtPct(l.slippage_rate)}`],
       ["Source des signaux", s.bot.signal_source],
@@ -313,6 +373,15 @@
       head: ["Heure", "Symbole", "Sens", "Prix", "Source", "Statut", "Raison"],
       row: (s) => [fmtTime(s.timestamp), esc(s.symbol), esc(s.direction), fmtPrice(s.price), esc(s.source), esc(s.status), esc(s.reason)],
     },
+    decisions: {
+      url: "/api/ai/decisions?limit=100",
+      pick: (data) => data.decisions,
+      head: ["Heure", "Symbole", "Déclencheur", "Action", "Confiance", "Statut", "Résultat", "Thèse / raison"],
+      row: (d) => [fmtTime(d.timestamp), esc(d.symbol), esc(d.trigger), esc(d.action),
+        d.confidence != null ? fmtNum(d.confidence, 2) : "—", esc(d.status),
+        d.outcome_r != null ? `<span class="${signClass(d.outcome_r)}">${fmtSigned(d.outcome_r, 2)} R</span>` : "—",
+        esc((d.thesis || d.status_reason || "").slice(0, 160))],
+    },
     events: {
       url: "/api/events?limit=150",
       head: ["Heure", "Niveau", "Type", "Message"],
@@ -322,7 +391,8 @@
 
   async function loadTable() {
     const spec = TABLES[state.table];
-    const rows = await api(spec.url);
+    const data = await api(spec.url);
+    const rows = spec.pick ? spec.pick(data) : data;
     const head = `<thead><tr>${spec.head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>`;
     const body = rows.length
       ? rows.map((r) => `<tr>${spec.row(r).map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")
@@ -389,6 +459,10 @@
       case "signal":
         if (state.table === "signals") refresh("table", loadTable);
         break;
+      case "ai_decision":
+        refresh("decisions", loadDecisions);
+        if (state.table === "decisions") refresh("table", loadTable);
+        break;
       case "optimization":
         refresh("optimizer", loadOptimizer);
         if (state.table === "events") refresh("table", loadTable);
@@ -412,7 +486,7 @@
     state.symbol = state.symbol || status.bot.symbols[0];
     renderStatus(status);
     renderSymbolTabs();
-    await Promise.all([loadCandles(state.symbol), loadEquity(), loadTable(), loadOptimizer()]);
+    await Promise.all([loadCandles(state.symbol), loadEquity(), loadTable(), loadOptimizer(), loadDecisions()]);
     if (!state.ws) connectWs();
     state.started = true;
   }
@@ -463,11 +537,23 @@
       } catch (error) { window.alert(error.message); }
     });
     $("wallet-connect").addEventListener("click", readWallet);
+    $("ai-analyze").addEventListener("click", async () => {
+      $("ai-analyze").disabled = true;
+      try {
+        const r = await api(`/api/ai/analyze/${encodeURIComponent(state.symbol)}`, { method: "POST" });
+        $("ai-analyze").textContent = r.kind === "review" ? "Revue en cours…" : "Analyse en cours…";
+        setTimeout(() => { $("ai-analyze").textContent = "Analyser maintenant"; }, 30000);
+      } catch (error) { window.alert(error.message); }
+    });
+    $("ai-briefing").addEventListener("click", async () => {
+      $("ai-briefing").disabled = true;
+      try { await api("/api/ai/briefing", { method: "POST" }); } catch (error) { window.alert(error.message); }
+    });
     $("theme-toggle").addEventListener("click", () =>
       applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
   }
 
-  document.documentElement.dataset.theme = store.get(THEME_KEY) || "light";
+  document.documentElement.dataset.theme = store.get(THEME_KEY) || "dark";
   initCharts();
   bindEvents();
   if (state.token) start().catch(() => askToken(false)); else askToken(false);

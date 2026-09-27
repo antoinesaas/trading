@@ -196,5 +196,8 @@ async def tradingview_webhook(request: Request) -> dict[str, Any]:
                     atr=alert.atr, timestamp=alert.timestamp, strategy=alert.strategy,
                     reason=f"Alerte TradingView {alert.action} ({alert.strategy})",
                     source=SignalSource.TRADINGVIEW)
+    if services.ai_trader is not None:  # Claude décide ; réponse immédiate (délai TradingView court)
+        services.ai_trader.spawn(services.ai_trader.evaluate(alert.symbol, "tradingview", signal))
+        return {"status": "queued", "reason": "Signal transmis à Claude pour décision", "order_id": None}
     outcome = services.stack.engine.handle_signal(signal, utcnow())
     return {"status": outcome.status, "reason": outcome.reason, "order_id": outcome.order_id}

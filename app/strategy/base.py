@@ -36,6 +36,7 @@ class CandleWindow:
     high: FloatArray
     low: FloatArray
     close: FloatArray
+    volume: FloatArray
 
     @classmethod
     def from_candles(cls, candles: Sequence[Candle]) -> CandleWindow:
@@ -50,6 +51,7 @@ class CandleWindow:
             high=np.fromiter((c.high for c in candles), np.float64, len(candles)),
             low=np.fromiter((c.low for c in candles), np.float64, len(candles)),
             close=np.fromiter((c.close for c in candles), np.float64, len(candles)),
+            volume=np.fromiter((c.volume for c in candles), np.float64, len(candles)),
         )
 
     def __len__(self) -> int:

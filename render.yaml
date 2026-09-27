@@ -1,0 +1,25 @@
+# Déploiement 24/7 sur Render (Blueprint) : Render > New > Blueprint > dépôt antoinesaas/trading.
+# Render demande alors les valeurs marquées « sync: false » (à saisir par vous, jamais dans Git).
+services:
+  - type: web
+    name: trading-bot
+    runtime: docker
+    plan: starter            # toujours actif ; l'offre gratuite se met en veille et couperait le bot
+    region: frankfurt
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: BOT_AUTO_START
+        value: "true"
+      - key: DECISION_MODE
+        value: ai
+      - key: DATABASE_URL        # chaîne « Session pooler » Supabase avec votre mot de passe
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: DASHBOARD_TOKEN
+        generateValue: true

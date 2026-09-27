@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
@@ -45,7 +46,8 @@ class BotRunner:
     def __init__(self, engine: TradingEngine, provider: MarketDataProvider, bus: EventBus, *,
                  symbols: list[str], timeframe: str, poll_interval: float,
                  repository: TradingRepository | None = None,
-                 last_processed: dict[str, str] | None = None) -> None:
+                 last_processed: dict[str, str] | None = None,
+                 after_tick: Callable[[list[str]], Awaitable[None]] | None = None) -> None:
         self.engine = engine
         self.provider = provider
         self.bus = bus
@@ -53,6 +55,7 @@ class BotRunner:
         self.timeframe = timeframe
         self.poll_interval = poll_interval
         self.repository = repository
+        self.after_tick = after_tick
         self._tf = timedelta(seconds=timeframe_seconds(timeframe))
         self._status = BotStatus.STOPPED
         self._task: asyncio.Task[None] | None = None
@@ -130,12 +133,16 @@ class BotRunner:
             await asyncio.sleep(self.poll_interval)
 
     async def tick(self) -> None:
+        fresh: list[str] = []
         for symbol in self.symbols:
             if symbol not in self._warmed:
                 await self._warm_up(symbol)
-            await self._process(symbol)
+            if await self._process(symbol):
+                fresh.append(symbol)
         self.last_tick = utcnow()
         self._persist_progress()
+        if self.after_tick is not None and self._status is BotStatus.RUNNING:
+            await self.after_tick(fresh)
 
     async def _fetch(self, symbol: str, limit: int) -> list[Candle]:
         return await asyncio.to_thread(self.provider.fetch_candles, symbol, self.timeframe, limit)
@@ -153,11 +160,13 @@ class BotRunner:
         self._warmed.add(symbol)
         logger.info("%s : %d bougies chargées, %d rattrapées", symbol, len(history), len(missed))
 
-    async def _process(self, symbol: str) -> None:
+    async def _process(self, symbol: str) -> bool:
+        """Traite les nouvelles bougies ; retourne ``True`` si une bougie récente vient de clôturer."""
         last = self.engine.last_closed_time(symbol)
         candles = await self._fetch(symbol, self._fetch_limit(last))
         closed = [c for c in candles if c.closed and (last is None or c.open_time > last)]
         now = utcnow()
+        fresh = False
         for index, candle in enumerate(closed):
             fresh = now - candle.close_time <= self._tf
             self.engine.on_bar_update(candle)
@@ -167,6 +176,7 @@ class BotRunner:
             self.forming[symbol] = candles[-1]
             self.engine.on_bar_update(candles[-1])
             self.bus.publish(EventType.CANDLE, candle_message(candles[-1]))
+        return fresh
 
     def _fetch_limit(self, last: datetime | None) -> int:
         if last is None:

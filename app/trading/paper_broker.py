@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import replace
 from datetime import datetime
 from typing import ClassVar
 
@@ -59,7 +60,9 @@ class PaperBroker(Broker):
             status=OrderStatus.PENDING, created_at=now, strategy=request.strategy,
             reason=request.reason, limit_price=request.limit_price,
             reference_price=request.reference_price, stop_distance=request.stop_distance,
-            take_profit_distance=request.take_profit_distance,
+            take_profit_distance=request.take_profit_distance, tp1_distance=request.tp1_distance,
+            tp1_fraction=request.tp1_fraction, breakeven_at_r=request.breakeven_at_r,
+            time_stop=request.time_stop, decision_id=request.decision_id, confidence=request.confidence,
         )
         self._pending.append(order)
         self.log.info("Paper Order #%d créé : %s %s %s qty=%g (%s)", seq, order.order_type, order.side,
@@ -105,34 +108,66 @@ class PaperBroker(Broker):
             strategy=position.strategy, reason=reason,
         ), now)
 
-    def modify_stop(self, symbol: str, new_stop: float, now: datetime, reason: str) -> None:
+    def modify_stop(self, symbol: str, new_stop: float, now: datetime, reason: str,
+                    kind: str = "trailing") -> None:
         position = self.portfolio.position(symbol)
-        if position is None:
+        if position is None or not new_stop > 0:
             return
         position.stop_loss = new_stop
-        position.trailing_active = True
-        self.log.info("Trailing stop %s déplacé à %.8g (%s)", symbol, new_stop, reason)
+        if kind == "trailing":
+            position.trailing_active, position.stop_reason = True, "Trailing stop touché"
+        elif kind == "breakeven":
+            position.breakeven_done, position.stop_reason = True, "Stop au point mort touché"
+        else:
+            position.stop_reason = "Stop ajusté par l'IA touché"
+        self.log.info("Stop %s déplacé à %.8g (%s : %s)", symbol, new_stop, kind, reason)
+        self.bus.publish(EventType.POSITION_UPDATED, to_payload(position))
+
+    def modify_take_profit(self, symbol: str, new_target: float, now: datetime, reason: str) -> None:
+        position = self.portfolio.position(symbol)
+        if position is None or not new_target > 0:
+            return
+        position.take_profit = new_target
+        self.log.info("Objectif %s déplacé à %.8g (%s)", symbol, new_target, reason)
         self.bus.publish(EventType.POSITION_UPDATED, to_payload(position))
 
     # -- Exécution ------------------------------------------------------------------
     def process_bar(self, candle: Candle) -> None:
         for order in [o for o in self._pending if o.symbol == candle.symbol]:
             self._try_fill(order, candle)
-        self._check_exit(candle)
+        position = self.portfolio.position(candle.symbol)
+        if position is not None:
+            view = _after_entry(candle, position.entry_time)
+            position.track_extremes(view)
+            self._check_exit(view)
         self.portfolio.update_price(candle.symbol, candle.close)
 
     def _try_fill(self, order: Order, candle: Candle) -> None:
-        # Exécution uniquement sur une bougie ouverte après l'ordre : jamais à un prix passé.
-        if candle.open_time < order.created_at:
+        """Jamais à un prix antérieur à l'ordre.
+
+        - bougie ouverte après l'ordre (backtest, changement de bougie) : prix d'ouverture ;
+        - bougie en formation ouverte avant l'ordre (décision IA ou webhook en cours de
+          bougie, temps réel) : dernier prix observé, qui est postérieur à l'ordre ;
+        - bougie clôturée ouverte avant l'ordre : on attend la suivante.
+        """
+        if candle.open_time >= order.created_at:
+            view, fill_time = candle, candle.open_time
+        elif not candle.closed:
+            view, fill_time = _point(candle), order.created_at
+        else:
             return
-        price = self._fill_price(order, candle)
+        price = self._fill_price(order, view)
         if price is None:
             return
         self._pending.remove(order)
         if order.intent is OrderIntent.OPEN:
-            self._fill_entry(order, price, candle)
-        else:
-            self._fill_close(order, price, candle)
+            self._fill_entry(order, price, view, fill_time)
+            return
+        position = self.portfolio.position(order.symbol)
+        if position is None:
+            self._reject(order, "Aucune position à clôturer")
+            return
+        self._close(position, view.open, fill_time, OrderType.MARKET, order.reason, order)
 
     def _fill_price(self, order: Order, candle: Candle) -> float | None:
         if order.order_type is OrderType.MARKET:
@@ -142,7 +177,7 @@ class PaperBroker(Broker):
             return candle.open if candle.open <= limit else (limit if candle.low <= limit else None)
         return candle.open if candle.open >= limit else (limit if candle.high >= limit else None)
 
-    def _fill_entry(self, order: Order, price: float, candle: Candle) -> None:
+    def _fill_entry(self, order: Order, price: float, candle: Candle, fill_time: datetime) -> None:
         if self.portfolio.position(order.symbol) is not None:
             self._reject(order, "Position déjà ouverte sur ce symbole")
             return
@@ -161,12 +196,16 @@ class PaperBroker(Broker):
         position_id, position_seq = self.ids.next("POS")
         position = Position(
             id=position_id, seq=position_seq, symbol=order.symbol, direction=direction,
-            quantity=quantity, entry_price=price, entry_time=candle.open_time, stop_loss=stop,
+            quantity=quantity, entry_price=price, entry_time=fill_time, stop_loss=stop,
             take_profit=take_profit, initial_stop_loss=stop, entry_fee=fee, entry_slippage=slippage,
             strategy=order.strategy, entry_order_id=order.id, entry_reason=order.reason,
+            tp1_price=price + direction.sign * order.tp1_distance if order.tp1_distance else None,
+            tp1_fraction=order.tp1_fraction, breakeven_at_r=order.breakeven_at_r,
+            time_stop_at=fill_time + order.time_stop if order.time_stop else None,
+            decision_id=order.decision_id, confidence=order.confidence,
         )
         self.portfolio.open_position(position)
-        self._mark_filled(order, price, candle.open_time, fee, slippage, position.id, quantity)
+        self._mark_filled(order, price, fill_time, fee, slippage, position.id, quantity)
         order.stop_loss, order.take_profit = stop, take_profit
         self._publish_order(order)
         self.log.info("Position ouverte à %.8g (%s %s qty=%g)", price, direction, order.symbol, quantity)
@@ -180,25 +219,53 @@ class PaperBroker(Broker):
                                         self.limits.qty_step)
         return min(quantity, affordable)
 
-    def _fill_close(self, order: Order, price: float, candle: Candle) -> None:
-        position = self.portfolio.position(order.symbol)
-        if position is None:
-            self._reject(order, "Aucune position à clôturer")
-            return
-        self._close(position, candle.open, candle.open_time, OrderType.MARKET, order.reason, order)
-
     def _check_exit(self, candle: Candle) -> None:
         position = self.portfolio.position(candle.symbol)
         if position is None:
             return
-        trigger = position.exit_trigger(candle)
-        if trigger is None:
-            return
-        order_type, level = trigger
-        label = {OrderType.STOP_LOSS: "Stop-loss touché", OrderType.TRAILING_STOP: "Trailing stop touché",
-                 OrderType.TAKE_PROFIT: "Take-profit atteint"}[order_type]
         # Horodatage = ouverture de la bougie d'exécution (identique en backtest et en temps réel).
-        self._close(position, level, candle.open_time, order_type, label)
+        when = max(candle.open_time, position.entry_time)
+        for order_type, level in position.exit_events(candle):
+            if order_type is OrderType.TAKE_PROFIT_1:
+                if self._partial_close(position, level, when):
+                    continue
+                order_type = OrderType.TAKE_PROFIT
+            label = "Take-profit atteint" if order_type is OrderType.TAKE_PROFIT else position.stop_reason
+            if position.tp1_done:
+                label += " (TP1 partiel encaissé)"
+            self._close(position, level, when, order_type, label)
+            return
+
+    def _partial_close(self, position: Position, price: float, when: datetime) -> bool:
+        """Prise de profit partielle (limite, sans slippage) puis stop au point mort.
+
+        Retourne ``False`` si la quantité restante serait trop faible : la position est
+        alors clôturée entièrement par l'appelant.
+        """
+        lim = self.limits
+        quantity = round_down_to_step(position.initial_quantity * position.tp1_fraction, lim.qty_step)
+        position.tp1_done = True
+        if quantity < lim.min_qty:
+            return True
+        if position.quantity - quantity < lim.min_qty:
+            return False
+        fee = quantity * price * lim.fee_rate
+        order_id, seq = self.ids.next("PO")
+        order = Order(id=order_id, seq=seq, symbol=position.symbol, side=position.direction.exit_side,
+                      order_type=OrderType.TAKE_PROFIT_1, intent=OrderIntent.CLOSE, quantity=quantity,
+                      status=OrderStatus.PENDING, created_at=when, strategy=position.strategy,
+                      reason="Prise de profit partielle (TP1)", reference_price=price)
+        gross = self.portfolio.realize_partial(position.symbol, quantity, price, fee, 0.0)
+        self._mark_filled(order, price, when, fee, 0.0, position.id, quantity)
+        self._publish_order(order)
+        breakeven = position.entry_price * (1 + position.direction.sign * 2 * lim.fee_rate)
+        if position.direction.sign * (breakeven - position.stop_loss) > 0:
+            position.stop_loss = breakeven
+            position.breakeven_done, position.stop_reason = True, "Stop au point mort touché"
+        self.log.info("TP1 %s : %g encaissés à %.8g (P&L brut %.2f), stop au point mort %.8g",
+                      position.symbol, quantity, price, gross, position.stop_loss)
+        self.bus.publish(EventType.POSITION_UPDATED, to_payload(position))
+        return True
 
     def _close(self, position: Position, level: float, when: datetime, order_type: OrderType,
                reason: str, order: Order | None = None) -> None:
@@ -245,3 +312,13 @@ class PaperBroker(Broker):
 
     def _publish_order(self, order: Order) -> None:
         self.bus.publish(EventType.ORDER, to_payload(order))
+
+
+def _point(candle: Candle) -> Candle:
+    """Réduit une bougie à son dernier prix (seuls les prix postérieurs à l'événement comptent)."""
+    return replace(candle, open=candle.close, high=candle.close, low=candle.close)
+
+
+def _after_entry(candle: Candle, entry_time: datetime) -> Candle:
+    """Sur la bougie d'entrée (entrée en cours de bougie), ignore les prix d'avant l'entrée."""
+    return _point(candle) if candle.open_time < entry_time else candle

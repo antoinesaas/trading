@@ -108,6 +108,15 @@ def test_market_data_client_is_read_only():
             client.get(path, {})
 
 
+def test_derivatives_and_sentiment_clients_are_read_only():
+    from app.market.derivatives import BinanceFuturesData, FearGreedIndex
+    futures, fng = BinanceFuturesData("https://f.invalid"), FearGreedIndex("https://s.invalid")
+    for client, path in ((futures._http, "/fapi/v1/order"), (futures._http, "/fapi/v1/leverage"),
+                         (fng._http, "/api/v3/order")):
+        with pytest.raises(LiveTradingDisabledError):
+            client.get(path, {})
+
+
 def test_market_data_provider_only_sends_get_klines():
     seen = []
 
@@ -123,7 +132,7 @@ def test_market_data_provider_only_sends_get_klines():
 
 FORBIDDEN = [
     r"eth_sendTransaction", r"eth_sendRawTransaction", r"eth_sign", r"personal_sign", r"wallet_sendCalls",
-    r"/api/v3/order", r"/fapi/", r"import ccxt", r"from web3", r"import web3", r"create_order\(",
+    r"/api/v3/order", r"/fapi/v1/order", r"/fapi/v1/batchOrders", r"/sapi/", r"/dapi/", r"import ccxt", r"from web3", r"import web3", r"create_order\(",
     r"signTransaction", r"privateKey",
 ]
 

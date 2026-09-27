@@ -113,13 +113,13 @@ if strategy.position_size < 0
     strategy.exit("SHORT_EXIT", "SHORT", stop = slLevel, limit = tpLevel)
 
 // --- Affichage -------------------------------------------------------------------------------
-plot(emaFast, "EMA rapide", color = chart.fg_color, linewidth = 2)
-plot(emaSlow, "EMA lente", color = color.gray, linewidth = 2)
-plot(slLevel, "Stop-loss", color = chart.fg_color, style = plot.style_linebr, linewidth = 1)
-plot(tpLevel, "Take-profit", color = color.gray, style = plot.style_linebr, linewidth = 1)
+plot(emaFast, "EMA rapide", color = color.new(#4c8dff, 0), linewidth = 2)
+plot(emaSlow, "EMA lente", color = color.new(#f5b041, 0), linewidth = 2)
+plot(slLevel, "Stop-loss", color = color.new(#f0506e, 0), style = plot.style_linebr, linewidth = 1)
+plot(tpLevel, "Take-profit", color = color.new(#16c784, 0), style = plot.style_linebr, linewidth = 1)
 plot(atrVal, "ATR", display = display.data_window)
-plotshape(longSignal, "Signal LONG", shape.triangleup, location.belowbar, chart.fg_color, text = "LONG", size = size.small)
-plotshape(shortSignal, "Signal SHORT", shape.triangledown, location.abovebar, chart.fg_color, text = "SHORT", size = size.small)
+plotshape(longSignal, "Signal LONG", shape.triangleup, location.belowbar, color.new(#16c784, 0), text = "LONG", size = size.small)
+plotshape(shortSignal, "Signal SHORT", shape.triangledown, location.abovebar, color.new(#f0506e, 0), text = "SHORT", size = size.small)
 
 // --- Alertes webhook (JSON attendu par POST /webhook/tradingview) ----------------------------
 payload(action) =>

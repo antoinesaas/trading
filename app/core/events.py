@@ -26,6 +26,8 @@ class EventType(StrEnum):
     BOT = "bot"
     RISK = "risk"
     OPTIMIZATION = "optimization"
+    AI_DECISION = "ai_decision"
+    BRIEFING = "briefing"
 
 
 @dataclass(frozen=True, slots=True)

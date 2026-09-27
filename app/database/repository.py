@@ -6,7 +6,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
@@ -15,8 +15,8 @@ from app.core.events import EngineEvent, EventType
 from app.core.types import Direction, OrderStatus, OrderType, Side, ensure_utc, utcnow
 from app.database.database import Database
 from app.database.models import (
-    Base, BotEventRow, BotStateRow, EquitySnapshotRow, OptimizationRunRow, OrderRow, PositionRow,
-    SignalRow, StrategyVersionRow, TradeRow,
+    AIDecisionRow, AIUsageRow, Base, BotEventRow, BotStateRow, EquitySnapshotRow, MarketBriefingRow,
+    OptimizationRunRow, OrderRow, PositionRow, SignalRow, StrategyVersionRow, TradeRow,
 )
 from app.engine.params import ParameterSet
 from app.trading.positions import Position, Trade
@@ -62,6 +62,7 @@ class RestoredState:
     id_counters: dict[str, int]
     day: date | None = None
     day_start_equity: float = 0.0
+    week_start_equity: float = 0.0
     halted: bool = False
     halt_reason: str | None = None
     last_processed: dict[str, str] = field(default_factory=dict)
@@ -96,7 +97,14 @@ class TradingRepository:
                 entry_fee=data["entry_fee"], entry_slippage=data["entry_slippage"],
                 trailing_active=data.get("trailing_active", False), strategy=data.get("strategy", ""),
                 entry_order_id=data["entry_order_id"], entry_reason=data.get("entry_reason", ""),
-                updated_at=utcnow(),
+                updated_at=utcnow(), initial_quantity=data.get("initial_quantity"),
+                tp1_price=data.get("tp1_price"), tp1_fraction=data.get("tp1_fraction"),
+                tp1_done=data.get("tp1_done"), breakeven_at_r=data.get("breakeven_at_r"),
+                breakeven_done=data.get("breakeven_done"), time_stop_at=_dt(data.get("time_stop_at")),
+                stop_reason=data.get("stop_reason"), realized_pnl=data.get("realized_pnl"),
+                exit_fees=data.get("exit_fees"), exit_slippage=data.get("exit_slippage"),
+                exit_notional=data.get("exit_notional"), best_price=data.get("best_price"),
+                decision_id=data.get("decision_id"), confidence=data.get("confidence"),
             ))
 
     def insert_trade(self, data: dict[str, Any]) -> None:
@@ -202,13 +210,20 @@ class TradingRepository:
                 select(EquitySnapshotRow.equity)
                 .where(EquitySnapshotRow.timestamp >= datetime(today.year, today.month, today.day, tzinfo=UTC))
                 .order_by(EquitySnapshotRow.id).limit(1))
+            monday = today - timedelta(days=today.weekday())
+            first_week = s.scalar(
+                select(EquitySnapshotRow.equity)
+                .where(EquitySnapshotRow.timestamp >= datetime(monday.year, monday.month, monday.day, tzinfo=UTC))
+                .order_by(EquitySnapshotRow.id).limit(1))
         positions = [_position_from_row(r) for r in open_rows]
-        balance = initial + realized - sum(p.entry_fee for p in positions)
+        # Les sorties partielles des positions ouvertes sont déjà encaissées dans la balance.
+        balance = initial + realized + sum(p.realized_pnl - p.exit_fees - p.entry_fee for p in positions)
         halt = self.get_state("risk_halt") or {}
         return RestoredState(
             initial_capital=initial, balance=balance, peak_equity=max(float(peak or initial), initial),
             positions=positions, id_counters=counters, day=today if first_today else None,
-            day_start_equity=float(first_today or 0.0), halted=bool(halt.get("halted")),
+            day_start_equity=float(first_today or 0.0), week_start_equity=float(first_week or 0.0),
+            halted=bool(halt.get("halted")),
             halt_reason=halt.get("reason"), last_processed=self.get_state("last_processed") or {},
         )
 
@@ -263,11 +278,80 @@ class TradingRepository:
     def list_runs(self, limit: int = 10) -> list[dict[str, Any]]:
         return self._recent(OptimizationRunRow, OptimizationRunRow.id, limit)
 
+    # -- Décisions IA, coûts et briefings -------------------------------------------------------------
+    def save_decision(self, **fields: Any) -> int:
+        with self.db.session() as s:
+            row = AIDecisionRow(timestamp=utcnow(), **fields)
+            s.add(row)
+            s.flush()
+            return row.id
+
+    def update_decision(self, decision_id: int, **fields: Any) -> None:
+        with self.db.session() as s:
+            s.execute(update(AIDecisionRow).where(AIDecisionRow.id == decision_id).values(**fields))
+
+    def record_decision_outcome(self, trade: dict[str, Any]) -> None:
+        if trade.get("decision_id") is None:
+            return
+        self.update_decision(int(trade["decision_id"]), outcome_net_pnl=trade["net_pnl"],
+                             outcome_r=trade["r_multiple"], outcome_reason=trade["reason"],
+                             closed_at=_dt(trade["exit_time"]))
+
+    def recent_decisions(self, limit: int = 30) -> list[dict[str, Any]]:
+        rows = self._recent(AIDecisionRow, AIDecisionRow.id, limit)
+        for row in rows:
+            row.pop("context", None)
+        return rows
+
+    def ai_track_record(self, journal_size: int = 8) -> dict[str, Any]:
+        """Calibration par niveau de confiance et derniers trades décidés par l'IA (mémoire)."""
+        with self.db.session() as s:
+            rows = s.scalars(select(AIDecisionRow).where(AIDecisionRow.outcome_r.is_not(None))
+                             .order_by(AIDecisionRow.id)).all()
+        buckets: dict[str, list[float]] = {}
+        for row in rows:
+            conf = row.confidence or 0.0
+            key = "0.80+" if conf >= 0.8 else "0.70-0.80" if conf >= 0.7 else "<0.70"
+            buckets.setdefault(key, []).append(row.outcome_r or 0.0)
+        calibration = {key: {"trades": len(rs), "taux_reussite": round(sum(r > 0 for r in rs) / len(rs), 3),
+                             "r_moyen": round(sum(rs) / len(rs), 3)} for key, rs in buckets.items()}
+        journal = [{"date": ensure_utc(r.timestamp).strftime("%Y-%m-%d %H:%M"), "symbole": r.symbol,
+                    "action": r.action, "confiance": r.confidence, "these": (r.thesis or "")[:240],
+                    "resultat_r": round(r.outcome_r or 0.0, 2), "sortie": r.outcome_reason}
+                   for r in rows[-journal_size:]]
+        return {"trades_ia_clotures": len(rows), "calibration_par_confiance": calibration,
+                "derniers_trades_ia": journal}
+
+    def insert_usage(self, record: Any) -> None:
+        with self.db.session() as s:
+            s.add(AIUsageRow(timestamp=record.timestamp, purpose=record.purpose, model=record.model,
+                             input_tokens=record.input_tokens, output_tokens=record.output_tokens,
+                             cache_read_tokens=record.cache_read_tokens,
+                             cache_write_tokens=record.cache_write_tokens, web_searches=record.web_searches,
+                             cost_usd=record.cost_usd))
+
+    def ai_spent_today(self) -> float:
+        today = datetime.now(UTC).date()
+        with self.db.session() as s:
+            return float(s.scalar(select(func.coalesce(func.sum(AIUsageRow.cost_usd), 0.0)).where(
+                AIUsageRow.timestamp >= datetime(today.year, today.month, today.day, tzinfo=UTC))) or 0.0)
+
+    def save_briefing(self, briefing: Any) -> None:
+        with self.db.session() as s:
+            s.add(MarketBriefingRow(generated_at=briefing.generated_at, model=briefing.model,
+                                    risk_level=briefing.risk_level, sentiment=briefing.overall_sentiment,
+                                    summary=briefing.summary, data=briefing.model_dump(mode="json")))
+
+    def latest_briefing(self) -> dict[str, Any] | None:
+        with self.db.session() as s:
+            row = s.scalars(select(MarketBriefingRow).order_by(MarketBriefingRow.id.desc()).limit(1)).first()
+        return None if row is None else row.data
+
     # -- Remise à zéro ----------------------------------------------------------------------------
     def reset_paper_account(self) -> None:
         with self.db.session() as s:
             for model in (OrderRow, PositionRow, TradeRow, EquitySnapshotRow, SignalRow, BotEventRow,
-                          BotStateRow):
+                          BotStateRow, AIDecisionRow):
                 s.execute(delete(model))
         logger.warning("Compte paper réinitialisé (ordres, positions, trades, equity, signaux, événements).")
 
@@ -279,7 +363,14 @@ def _position_from_row(row: PositionRow) -> Position:
         stop_loss=row.stop_loss, take_profit=row.take_profit, initial_stop_loss=row.initial_stop_loss,
         entry_fee=row.entry_fee, entry_slippage=row.entry_slippage, strategy=row.strategy,
         entry_order_id=row.entry_order_id, entry_reason=row.entry_reason,
-        trailing_active=row.trailing_active,
+        trailing_active=row.trailing_active, initial_quantity=row.initial_quantity or 0.0,
+        tp1_price=row.tp1_price, tp1_fraction=row.tp1_fraction or 0.0, tp1_done=bool(row.tp1_done),
+        breakeven_at_r=row.breakeven_at_r or 0.0, breakeven_done=bool(row.breakeven_done),
+        time_stop_at=ensure_utc(row.time_stop_at) if row.time_stop_at else None,
+        stop_reason=row.stop_reason or "Stop-loss touché", realized_pnl=row.realized_pnl or 0.0,
+        exit_fees=row.exit_fees or 0.0, exit_slippage=row.exit_slippage or 0.0,
+        exit_notional=row.exit_notional or 0.0, best_price=row.best_price or 0.0,
+        decision_id=row.decision_id, confidence=row.confidence,
     )
 
 
@@ -292,7 +383,8 @@ def _trade_from_row(row: TradeRow) -> Trade:
         stop_loss=row.stop_loss, take_profit=row.take_profit, fees=row.fees, slippage=row.slippage,
         gross_pnl=row.gross_pnl, net_pnl=row.net_pnl, return_pct=row.return_pct,
         r_multiple=row.r_multiple, strategy=row.strategy, reason=row.reason,
-        entry_reason=row.entry_reason,
+        entry_reason=row.entry_reason, decision_id=row.decision_id, confidence=row.confidence,
+        max_favorable_r=row.max_favorable_r or 0.0,
     )
 
 
@@ -313,6 +405,7 @@ class DatabaseRecorder:
                 self.repo.upsert_position(data, "CLOSED")
             case EventType.TRADE:
                 self.repo.insert_trade(data)
+                self.repo.record_decision_outcome(data)
             case EventType.EQUITY:
                 self.repo.insert_equity(data)
             case EventType.SIGNAL:

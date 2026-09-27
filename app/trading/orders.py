@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.core.types import Direction, OrderIntent, OrderStatus, OrderType, Side
 
@@ -19,6 +19,12 @@ class OrderRequest:
     reference_price: float | None = None
     stop_distance: float | None = None
     take_profit_distance: float | None = None
+    tp1_distance: float | None = None
+    tp1_fraction: float = 0.0
+    breakeven_at_r: float = 0.0
+    time_stop: timedelta | None = None
+    decision_id: int | None = None
+    confidence: float | None = None
     strategy: str = ""
     reason: str = ""
 
@@ -52,6 +58,12 @@ class Order:
     stop_loss: float | None = None
     take_profit: float | None = None
     reject_reason: str | None = None
+    tp1_distance: float | None = None
+    tp1_fraction: float = 0.0
+    breakeven_at_r: float = 0.0
+    time_stop: timedelta | None = None
+    decision_id: int | None = None
+    confidence: float | None = None
 
     @property
     def is_pending(self) -> bool:

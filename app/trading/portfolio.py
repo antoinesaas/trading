@@ -73,25 +73,44 @@ class Portfolio:
         self.balance -= position.entry_fee
         self.positions[position.symbol] = position
 
+    def realize_partial(self, symbol: str, quantity: float, price: float, fee: float,
+                        slippage: float) -> float:
+        """Sortie partielle : encaisse le P&L de ``quantity`` unités ; retourne le P&L brut."""
+        position = self.positions[symbol]
+        gross = position.direction.sign * (price - position.entry_price) * quantity
+        position.quantity -= quantity
+        position.realized_pnl += gross
+        position.exit_fees += fee
+        position.exit_slippage += slippage
+        position.exit_notional += quantity * price
+        self.balance += gross - fee
+        return gross
+
     def close_position(self, symbol: str, *, trade_id: str, trade_seq: int, exit_price: float,
                        exit_time: datetime, exit_fee: float, exit_slippage: float,
                        order_type: OrderType, reason: str) -> Trade:
         position = self.positions.pop(symbol)
-        gross = position.unrealized_pnl(exit_price)
-        fees = position.entry_fee + exit_fee
+        final_gross = position.unrealized_pnl(exit_price)
+        gross = position.realized_pnl + final_gross
+        fees = position.entry_fee + position.exit_fees + exit_fee
         net = gross - fees
-        self.balance += gross - exit_fee
-        initial_risk = position.initial_risk_per_unit * position.quantity
+        self.balance += final_gross - exit_fee
+        quantity = position.initial_quantity
+        average_exit = (position.exit_notional + exit_price * position.quantity) / quantity
+        initial_risk = position.initial_risk_per_unit * quantity
+        cost = position.entry_price * quantity
         trade = Trade(
             id=trade_id, seq=trade_seq, position_id=position.id, symbol=symbol,
             direction=position.direction, side=position.side, order_type=order_type,
             entry_time=position.entry_time, exit_time=exit_time, entry_price=position.entry_price,
-            exit_price=exit_price, quantity=position.quantity, stop_loss=position.initial_stop_loss,
+            exit_price=average_exit, quantity=quantity, stop_loss=position.initial_stop_loss,
             take_profit=position.take_profit, fees=fees,
-            slippage=position.entry_slippage + exit_slippage, gross_pnl=gross, net_pnl=net,
-            return_pct=net / position.cost_basis if position.cost_basis else 0.0,
+            slippage=position.entry_slippage + position.exit_slippage + exit_slippage,
+            gross_pnl=gross, net_pnl=net, return_pct=net / cost if cost else 0.0,
             r_multiple=net / initial_risk if initial_risk else 0.0,
             strategy=position.strategy, reason=reason, entry_reason=position.entry_reason,
+            decision_id=position.decision_id, confidence=position.confidence,
+            max_favorable_r=position.r_multiple(position.best_price),
         )
         self.trades.append(trade)
         return trade

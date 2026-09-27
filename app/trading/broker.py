@@ -30,8 +30,13 @@ class Broker(ABC):
         """Demande la clôture au marché de la position ouverte sur ``symbol``."""
 
     @abstractmethod
-    def modify_stop(self, symbol: str, new_stop: float, now: datetime, reason: str) -> None:
-        """Déplace le stop de la position (trailing stop)."""
+    def modify_stop(self, symbol: str, new_stop: float, now: datetime, reason: str,
+                    kind: str = "trailing") -> None:
+        """Déplace le stop (``kind`` : trailing, breakeven ou manual)."""
+
+    @abstractmethod
+    def modify_take_profit(self, symbol: str, new_target: float, now: datetime, reason: str) -> None:
+        """Déplace l'objectif de la position."""
 
     @abstractmethod
     def process_bar(self, candle: Candle) -> None:

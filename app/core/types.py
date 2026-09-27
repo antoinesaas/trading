@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -35,6 +35,7 @@ class OrderType(StrEnum):
     LIMIT = "LIMIT"
     STOP_LOSS = "STOP_LOSS"
     TAKE_PROFIT = "TAKE_PROFIT"
+    TAKE_PROFIT_1 = "TAKE_PROFIT_1"  # prise de profit partielle
     TRAILING_STOP = "TRAILING_STOP"
 
 
@@ -101,6 +102,8 @@ def to_payload(obj: Any) -> Any:
         return [to_payload(v) for v in obj]
     if isinstance(obj, datetime):
         return obj.isoformat()
+    if isinstance(obj, timedelta):
+        return obj.total_seconds()
     if isinstance(obj, StrEnum):
         return obj.value
     if isinstance(obj, float) and obj != obj:  # NaN -> null

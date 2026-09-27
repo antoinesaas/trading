@@ -47,6 +47,9 @@ class MarketDataProvider(ABC):
         return candles[-bars:]
 
 
+SPOT_MARKET_PATHS = frozenset({"/api/v3/klines", "/api/v3/ticker/24hr", "/api/v3/depth"})
+
+
 class ReadOnlyHttpClient:
     """Client HTTP limité à une liste blanche de chemins GET de données publiques.
 
@@ -54,14 +57,14 @@ class ReadOnlyHttpClient:
     transiter par ce client.
     """
 
-    ALLOWED_PATHS = frozenset({"/api/v3/klines"})
-
     def __init__(self, base_url: str, timeout: float = 10.0,
-                 transport: httpx.BaseTransport | None = None) -> None:
+                 transport: httpx.BaseTransport | None = None,
+                 allowed_paths: frozenset[str] = SPOT_MARKET_PATHS) -> None:
+        self.allowed_paths = allowed_paths
         self._client = httpx.Client(base_url=base_url, timeout=timeout, transport=transport)
 
     def get(self, path: str, params: dict[str, Any]) -> Any:
-        if path not in self.ALLOWED_PATHS:
+        if path not in self.allowed_paths:
             raise LiveTradingDisabledError(f"Requête HTTP vers {path!r} interdite (lecture seule).")
         try:
             response = self._client.get(path, params=params)
@@ -103,6 +106,27 @@ class BinanceMarketDataProvider(MarketDataProvider):
             collected.update((c.open_time, c) for c in page)
             end_time = page[0].open_time - timedelta(milliseconds=1)
         return sorted(collected.values(), key=lambda c: c.open_time)[-bars:]
+
+    def ticker_24h(self, symbol: str) -> dict[str, float]:
+        data = self._http.get("/api/v3/ticker/24hr", {"symbol": symbol})
+        return {key: float(data[key]) for key in ("lastPrice", "priceChangePercent", "highPrice", "lowPrice",
+                                                   "quoteVolume", "weightedAvgPrice")}
+
+    def order_book(self, symbol: str, depth: int = 100) -> dict[str, float]:
+        """Spread et déséquilibre acheteurs/vendeurs sur les meilleurs niveaux du carnet."""
+        data = self._http.get("/api/v3/depth", {"symbol": symbol, "limit": depth})
+        bids = [(float(p), float(q)) for p, q in data["bids"]]
+        asks = [(float(p), float(q)) for p, q in data["asks"]]
+        if not bids or not asks:
+            raise MarketDataError(f"Carnet d'ordres vide pour {symbol}")
+        mid = (bids[0][0] + asks[0][0]) / 2
+        near = mid * 0.005  # liquidité à ±0,5 % du prix
+        bid_depth = sum(p * q for p, q in bids if p >= mid - near)
+        ask_depth = sum(p * q for p, q in asks if p <= mid + near)
+        total = bid_depth + ask_depth
+        return {"mid": mid, "spread_pct": (asks[0][0] - bids[0][0]) / mid,
+                "bid_depth_quote": bid_depth, "ask_depth_quote": ask_depth,
+                "imbalance": (bid_depth - ask_depth) / total if total else 0.0}
 
     @staticmethod
     def _parse_row(symbol: str, timeframe: str, row: Sequence[Any], now_ms: int) -> Candle:

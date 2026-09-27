@@ -46,7 +46,11 @@ class WalletBroker(Broker):
     def close_position(self, symbol: str, reason: str, now: datetime) -> Order | None:
         _blocked()
 
-    def modify_stop(self, symbol: str, new_stop: float, now: datetime, reason: str) -> None:
+    def modify_stop(self, symbol: str, new_stop: float, now: datetime, reason: str,
+                    kind: str = "trailing") -> None:
+        _blocked()
+
+    def modify_take_profit(self, symbol: str, new_target: float, now: datetime, reason: str) -> None:
         _blocked()
 
     def process_bar(self, candle: Candle) -> None:

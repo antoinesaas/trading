@@ -112,13 +112,19 @@ def render_context(context: OptimizationContext) -> str:
 
 class ClaudeParameterAdvisor:
     def __init__(self, api_key: str, model: str = "claude-opus-5-5", effort: str = "high",
-                 client: anthropic.Anthropic | None = None) -> None:
+                 client: anthropic.Anthropic | None = None, claude: Any = None) -> None:
         self.model_name = model
         self.effort = effort
+        self._claude = claude
         self._client = client or anthropic.Anthropic(api_key=api_key)
 
     def propose(self, context: OptimizationContext) -> AdvisorResponse:
         output_model = build_output_model(STRATEGIES[context.strategy_name].params_model)
+        if self._claude is not None:  # client commun : budget et coûts suivis
+            parsed = self._claude.structured(
+                purpose="optimisation", model=self.model_name, effort=self.effort, system=SYSTEM_PROMPT,
+                user=render_context(context), output_model=output_model, estimate_usd=0.5)
+            return self._convert(parsed)
         try:
             response = self._client.messages.parse(
                 model=self.model_name,
@@ -149,6 +155,10 @@ class ClaudeParameterAdvisor:
             raise AdvisorError("Réponse de Claude sans sortie structurée exploitable")
         logger.info("Claude a proposé %d candidats (requête %s)", len(parsed.proposals),
                     getattr(response, "_request_id", "?"))
+        return ClaudeParameterAdvisor._convert(parsed)
+
+    @staticmethod
+    def _convert(parsed: Any) -> AdvisorResponse:
         return AdvisorResponse(
             analysis=parsed.analysis,
             proposals=[AdvisorProposal(p.strategy.model_dump(), p.exits.model_dump(), p.rationale)
