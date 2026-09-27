@@ -1,0 +1,106 @@
+"""Portefeuille simulé : balance, equity, P&L réalisé/latent, drawdown.
+
+Conventions comptables :
+- ``balance`` = capital initial + P&L net réalisé - frais d'entrée des positions ouvertes ;
+- ``equity``  = balance + P&L latent (mark-to-market au dernier prix) ;
+- pas de levier : chaque position (long ou short) immobilise son notionnel d'entrée.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from app.core.types import OrderType
+from app.trading.positions import Position, Trade
+
+
+@dataclass(frozen=True, slots=True)
+class EquitySnapshot:
+    timestamp: datetime
+    balance: float
+    equity: float
+    unrealized_pnl: float
+    drawdown: float
+    peak_equity: float
+    open_positions: int
+
+
+class Portfolio:
+    def __init__(self, initial_capital: float, balance: float | None = None,
+                 peak_equity: float | None = None) -> None:
+        if initial_capital <= 0:
+            raise ValueError("Le capital initial doit être > 0")
+        self.initial_capital = initial_capital
+        self.balance = initial_capital if balance is None else balance
+        self.peak_equity = max(peak_equity or initial_capital, self.balance)
+        self.positions: dict[str, Position] = {}
+        self.trades: list[Trade] = []
+
+    # -- Lecture ------------------------------------------------------------------
+    def position(self, symbol: str) -> Position | None:
+        return self.positions.get(symbol)
+
+    def reserved_cash(self) -> float:
+        return sum(p.cost_basis for p in self.positions.values())
+
+    def available_cash(self) -> float:
+        return self.balance - self.reserved_cash()
+
+    def unrealized_pnl(self) -> float:
+        return sum(p.unrealized_pnl() for p in self.positions.values())
+
+    def equity(self) -> float:
+        return self.balance + self.unrealized_pnl()
+
+    def realized_pnl(self) -> float:
+        return sum(t.net_pnl for t in self.trades)
+
+    def drawdown(self) -> float:
+        equity = self.equity()
+        peak = max(self.peak_equity, equity)
+        return (peak - equity) / peak if peak > 0 else 0.0
+
+    # -- Mutations ------------------------------------------------------------------
+    def update_price(self, symbol: str, price: float) -> None:
+        position = self.positions.get(symbol)
+        if position is not None:
+            position.last_price = price
+
+    def open_position(self, position: Position) -> None:
+        if position.symbol in self.positions:
+            raise ValueError(f"Une position est déjà ouverte sur {position.symbol}")
+        self.balance -= position.entry_fee
+        self.positions[position.symbol] = position
+
+    def close_position(self, symbol: str, *, trade_id: str, trade_seq: int, exit_price: float,
+                       exit_time: datetime, exit_fee: float, exit_slippage: float,
+                       order_type: OrderType, reason: str) -> Trade:
+        position = self.positions.pop(symbol)
+        gross = position.unrealized_pnl(exit_price)
+        fees = position.entry_fee + exit_fee
+        net = gross - fees
+        self.balance += gross - exit_fee
+        initial_risk = position.initial_risk_per_unit * position.quantity
+        trade = Trade(
+            id=trade_id, seq=trade_seq, position_id=position.id, symbol=symbol,
+            direction=position.direction, side=position.side, order_type=order_type,
+            entry_time=position.entry_time, exit_time=exit_time, entry_price=position.entry_price,
+            exit_price=exit_price, quantity=position.quantity, stop_loss=position.initial_stop_loss,
+            take_profit=position.take_profit, fees=fees,
+            slippage=position.entry_slippage + exit_slippage, gross_pnl=gross, net_pnl=net,
+            return_pct=net / position.cost_basis if position.cost_basis else 0.0,
+            r_multiple=net / initial_risk if initial_risk else 0.0,
+            strategy=position.strategy, reason=reason, entry_reason=position.entry_reason,
+        )
+        self.trades.append(trade)
+        return trade
+
+    def snapshot(self, timestamp: datetime) -> EquitySnapshot:
+        equity = self.equity()
+        self.peak_equity = max(self.peak_equity, equity)
+        return EquitySnapshot(
+            timestamp=timestamp, balance=self.balance, equity=equity,
+            unrealized_pnl=self.unrealized_pnl(), drawdown=self.drawdown(),
+            peak_equity=self.peak_equity, open_positions=len(self.positions),
+        )

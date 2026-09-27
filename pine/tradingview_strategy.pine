@@ -1,0 +1,134 @@
+//@version=6
+// =============================================================================
+// EMA / RSI / ATR — miroir TradingView du bot Python (app/strategy/ema_rsi_strategy.py)
+//
+// PAPER TRADING UNIQUEMENT : ce script ne passe aucun ordre réel. Il
+//   1. affiche EMA rapide / lente et les signaux LONG / SHORT ;
+//   2. simule la stratégie dans le Strategy Tester (mêmes règles que le bot) ;
+//   3. envoie une alerte JSON par signal au webhook du bot (POST /webhook/tradingview).
+//
+// Anti-repainting : signaux évalués uniquement sur bougie CLÔTURÉE
+// (barstate.isconfirmed, calc_on_every_tick=false, alert.freq_once_per_bar_close),
+// ordres exécutés à l'ouverture de la bougie suivante (process_orders_on_close=false).
+//
+// Alerte : Créer une alerte > Condition : ce script > « alert() function calls only »
+//          > Notifications : Webhook URL = https://<votre-domaine>/webhook/tradingview
+// =============================================================================
+strategy("EMA/RSI Paper Bot", overlay = true, initial_capital = 10000, pyramiding = 0,
+     default_qty_type = strategy.fixed, process_orders_on_close = false, calc_on_every_tick = false,
+     commission_type = strategy.commission.percent, commission_value = 0.1, slippage = 0)
+
+// --- Paramètres de stratégie -------------------------------------------------
+grpS = "Stratégie"
+emaFastLen = input.int(20, "EMA rapide", minval = 2, group = grpS)
+emaSlowLen = input.int(50, "EMA lente", minval = 3, group = grpS)
+rsiLen     = input.int(14, "RSI longueur", minval = 2, group = grpS)
+rsiLongTh  = input.float(50, "Seuil RSI long (>)", minval = 1, maxval = 99, group = grpS)
+rsiShortTh = input.float(50, "Seuil RSI short (<)", minval = 1, maxval = 99, group = grpS)
+atrLen     = input.int(14, "ATR longueur", minval = 2, group = grpS)
+
+// --- Gestion du risque (identique au Risk Manager Python) -----------------------
+grpR = "Risque"
+riskPct     = input.float(1.0, "Risque par trade (%)", minval = 0.01, maxval = 5, step = 0.1, group = grpR)
+slMult      = input.float(2.0, "Stop-loss (x ATR)", minval = 0.1, step = 0.1, group = grpR)
+rrRatio     = input.float(2.0, "Take-profit (x risque)", minval = 0.1, step = 0.1, group = grpR)
+useTrail    = input.bool(false, "Trailing stop", group = grpR)
+trailMult   = input.float(2.0, "Trailing (x ATR)", minval = 0.1, step = 0.1, group = grpR)
+trailActR   = input.float(1.0, "Activation du trailing (R)", minval = 0, step = 0.1, group = grpR)
+feePct      = input.float(0.1, "Frais par côté (%) — pour le sizing", minval = 0, step = 0.01, group = grpR)
+slipPct     = input.float(0.05, "Slippage (%) — pour le sizing", minval = 0, step = 0.01, group = grpR)
+qtyStep     = input.float(0.0001, "Pas de quantité", minval = 0.00000001, group = grpR)
+maxDailyPct = input.float(3.0, "Perte journalière max (%)", minval = 0.1, group = grpR)
+maxDdPct    = input.float(10.0, "Drawdown max (%)", minval = 0.1, group = grpR)
+
+// --- Webhook ------------------------------------------------------------------
+grpA = "Alertes webhook"
+webhookSecret = input.string("change_me", "WEBHOOK_SECRET (identique au .env)", group = grpA)
+strategyTag   = input.string("ema_rsi_tv", "Nom de stratégie", group = grpA)
+
+strategy.risk.max_intraday_loss(maxDailyPct, strategy.percent_of_equity)
+strategy.risk.max_drawdown(maxDdPct, strategy.percent_of_equity)
+
+// --- Indicateurs ----------------------------------------------------------------
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+rsiVal  = ta.rsi(close, rsiLen)
+atrVal  = ta.atr(atrLen)
+
+// --- Règles (transition faux -> vrai, bougie clôturée uniquement) --------------------
+longCond    = emaFast > emaSlow and close > emaFast and rsiVal > rsiLongTh
+shortCond   = emaFast < emaSlow and close < emaFast and rsiVal < rsiShortTh
+longSignal  = barstate.isconfirmed and longCond and not longCond[1]
+shortSignal = barstate.isconfirmed and shortCond and not shortCond[1]
+
+// --- Taille de position : risque / (distance stop + frais + slippage au stop) -------------
+fee       = feePct / 100
+slip      = slipPct / 100
+stopDist  = atrVal * slMult
+roundQty(q) => math.floor(q / qtyStep) * qtyStep
+sizeFor(stopPrice) =>
+    unitRisk = stopDist + close * fee + stopPrice * (fee + slip)
+    riskQty  = roundQty(strategy.equity * riskPct / 100 / unitRisk)
+    cashQty  = roundQty(strategy.equity / (close * (1 + fee + slip)))
+    math.max(math.min(riskQty, cashQty), 0)
+
+var float entryStopDist = na
+var float trailStop = na
+
+if math.sign(strategy.position_size) != math.sign(strategy.position_size[1])
+    trailStop := na
+
+if longSignal and strategy.position_size <= 0 and not na(atrVal)
+    qty = sizeFor(close - stopDist)
+    if qty > 0
+        entryStopDist := stopDist
+        strategy.entry("LONG", strategy.long, qty = qty, comment = "LONG")
+        strategy.exit("LONG_EXIT", "LONG", stop = close - stopDist, limit = close + stopDist * rrRatio)
+
+if shortSignal and strategy.position_size >= 0 and not na(atrVal)
+    qty = sizeFor(close + stopDist)
+    if qty > 0
+        entryStopDist := stopDist
+        strategy.entry("SHORT", strategy.short, qty = qty, comment = "SHORT")
+        strategy.exit("SHORT_EXIT", "SHORT", stop = close + stopDist, limit = close - stopDist * rrRatio)
+
+// --- Sorties recalées sur le prix d'exécution réel + trailing stop ------------------------
+float slLevel = na
+float tpLevel = na
+if strategy.position_size > 0
+    avg = strategy.position_avg_price
+    if useTrail and close - avg >= trailActR * entryStopDist
+        candidate = close - atrVal * trailMult
+        trailStop := na(trailStop) ? candidate : math.max(trailStop, candidate)
+    slLevel := na(trailStop) ? avg - entryStopDist : math.max(avg - entryStopDist, trailStop)
+    tpLevel := avg + entryStopDist * rrRatio
+    strategy.exit("LONG_EXIT", "LONG", stop = slLevel, limit = tpLevel)
+if strategy.position_size < 0
+    avg = strategy.position_avg_price
+    if useTrail and avg - close >= trailActR * entryStopDist
+        candidate = close + atrVal * trailMult
+        trailStop := na(trailStop) ? candidate : math.min(trailStop, candidate)
+    slLevel := na(trailStop) ? avg + entryStopDist : math.min(avg + entryStopDist, trailStop)
+    tpLevel := avg - entryStopDist * rrRatio
+    strategy.exit("SHORT_EXIT", "SHORT", stop = slLevel, limit = tpLevel)
+
+// --- Affichage -------------------------------------------------------------------------------
+plot(emaFast, "EMA rapide", color = chart.fg_color, linewidth = 2)
+plot(emaSlow, "EMA lente", color = color.gray, linewidth = 2)
+plot(slLevel, "Stop-loss", color = chart.fg_color, style = plot.style_linebr, linewidth = 1)
+plot(tpLevel, "Take-profit", color = color.gray, style = plot.style_linebr, linewidth = 1)
+plot(atrVal, "ATR", display = display.data_window)
+plotshape(longSignal, "Signal LONG", shape.triangleup, location.belowbar, chart.fg_color, text = "LONG", size = size.small)
+plotshape(shortSignal, "Signal SHORT", shape.triangledown, location.abovebar, chart.fg_color, text = "SHORT", size = size.small)
+
+// --- Alertes webhook (JSON attendu par POST /webhook/tradingview) ----------------------------
+payload(action) =>
+    '{"secret":"' + webhookSecret + '","symbol":"' + syminfo.ticker + '","action":"' + action +
+     '","price":' + str.tostring(close, "#.########") + ',"atr":' + str.tostring(atrVal, "#.########") +
+     ',"timestamp":' + str.tostring(timenow) + ',"bar_time":' + str.tostring(time) +
+     ',"timeframe":"' + timeframe.period + '","strategy":"' + strategyTag + '"}'
+
+if longSignal
+    alert(payload("LONG"), alert.freq_once_per_bar_close)
+if shortSignal
+    alert(payload("SHORT"), alert.freq_once_per_bar_close)
