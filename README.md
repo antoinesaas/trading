@@ -15,6 +15,15 @@ sur chaque chiffre. Le bot apprend de chacun de ses trades, sans intervention.
 
 ## 1. Démarrage rapide (sur votre PC)
 
+**Windows, sans ligne de commande** : double-cliquez sur **`Lancer le bot.bat`**. La première fois,
+il installe tout (2-3 minutes) et ouvre le fichier `.env` pour y coller votre clé Claude
+(`ANTHROPIC_API_KEY=`) ; relancez-le ensuite. Le dashboard s'ouvre tout seul dans le
+navigateur, déjà connecté. Fermer la fenêtre noire arrête le bot.
+**`Tester les agents IA.bat`** vérifie la clé et chacun des 5 agents (décision, revue,
+leçon, actualités, optimisation) sans passer d'ordre, pour environ 0,40 $.
+
+En ligne de commande :
+
 ```bash
 git clone https://github.com/antoinesaas/trading.git
 cd trading
@@ -32,6 +41,7 @@ Ouvrez le dashboard, saisissez le `DASHBOARD_TOKEN` du fichier `.env`, puis **St
 | Commande | Rôle |
 |---|---|
 | `python -m app serve` | Bot + dashboard + API + webhook TradingView |
+| `python -m app check-ai` | Teste la clé API et chaque agent IA (aucun ordre) |
 | `python -m app backtest --symbol BTCUSDT --timeframe 4h --csv data/BTCUSDT_4h.csv` | Backtest reproductible du scanner |
 | `python -m app fetch-data --symbol ETHUSDT --timeframe 4h --bars 3000` | Télécharge et fige un historique crypto |
 | `python -m app reset-paper --yes` | Remet le compte paper à zéro |

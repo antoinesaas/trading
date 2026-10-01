@@ -85,7 +85,7 @@ séance ; évite de porter une position de court terme à travers une publicatio
 déplacer l'objectif, CLOSE si la thèse est invalidée. Laisse courir les gagnants dont la thèse tient.
 - confidence entre 0 et 1, calibrée : ton historique et tes leçons passées te sont fournis ; applique \
 ces leçons et sois plus exigeant là où tu as perdu.
-- Prix cohérents avec le prix actuel. entry uniquement pour OPEN_*, adjustment uniquement pour ADJUST, \
+- Prix actuel : « prix_actuel.prix » (bougie en cours, c'est le prix d'un ordre au marché) ; les indicateurs portent sur les bougies clôturées. Stop, objectif et limite cohérents avec ce prix. entry uniquement pour OPEN_*, adjustment uniquement pour ADJUST, \
 sinon null. Réponds en français, de façon concise."""
 
 LESSON_PROMPT = """Tu analyses a posteriori un trade clôturé par ton bot de paper trading, pour en \

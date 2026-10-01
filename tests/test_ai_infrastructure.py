@@ -108,6 +108,7 @@ def test_context_builder_tolerates_missing_sources():
     assert len(context["dernieres_bougies"]["valeurs"]) == 24
     assert context["derives"] is None and context["fear_greed_crypto"] is None
     assert context["instrument"]["classe"] == "crypto" and "milieu_d_influence" in context
+    assert context["prix_actuel"]["prix"] > 0  # prix en direct, en plus des bougies clôturées
     assert summarize_timeframe(generate_synthetic_candles(bars=30))["disponible"] is False
 
 

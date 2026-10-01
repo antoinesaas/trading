@@ -1,6 +1,6 @@
 """Interface en ligne de commande : ``python -m app <commande>``.
 
-Commandes : init-env, serve, backtest, fetch-data, optimize, reset-paper.
+Commandes : init-env, serve, check-ai, backtest, fetch-data, optimize, reset-paper.
 """
 
 from __future__ import annotations
@@ -125,6 +125,19 @@ def cmd_optimize(_: argparse.Namespace) -> int:
     return 0 if result["status"] != "error" else 1
 
 
+def cmd_check_ai(args: argparse.Namespace) -> int:
+    from app.ai.healthcheck import check_agents
+
+    print("Test de chaque agent IA avec la clé du fichier .env (aucun ordre, ~0,40 $)…\n")
+    results = check_agents(Settings(), args.symbol)
+    for r in results:
+        timing = f" ({r.seconds:.0f} s)" if r.seconds else ""
+        print(f"[{'OK' if r.ok else 'ÉCHEC'}] {r.agent} — {r.model}{timing}\n       {r.detail}")
+    failed = [r for r in results if not r.ok]
+    print("\nTous les agents IA fonctionnent." if not failed else f"\n{len(failed)} agent(s) en échec.")
+    return 1 if failed else 0
+
+
 def cmd_reset(args: argparse.Namespace) -> int:
     from app.database.database import Database
     from app.database.repository import TradingRepository
@@ -151,6 +164,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host")
     p.add_argument("--port", type=int)
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("check-ai", help="Teste la clé API et chaque agent IA (sans passer d'ordre)")
+    p.add_argument("--symbol", help="Marché utilisé pour le test (défaut : le premier de SYMBOLS)")
+    p.set_defaults(func=cmd_check_ai)
 
     p = sub.add_parser("backtest", help="Backtest avec le même moteur que le paper trading")
     p.add_argument("--symbol", default="BTCUSDT")

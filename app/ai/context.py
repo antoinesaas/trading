@@ -100,20 +100,31 @@ class MarketContextBuilder:
         """Contexte de marché (appel réseau : à exécuter hors de la boucle d'événements)."""
         frames: dict[str, Any] = {}
         recent: list[list[Any]] = []
+        live: dict[str, Any] | None = None
         for tf in dict.fromkeys([decision_timeframe, *self.timeframes]):
             try:
-                candles = [c for c in self.provider.fetch_candles(symbol, tf, HISTORY_BARS + 1) if c.closed]
+                fetched = self.provider.fetch_candles(symbol, tf, HISTORY_BARS + 1)
             except MarketDataError as exc:
                 frames[tf] = {"disponible": False, "raison": str(exc)}
                 continue
+            candles = [c for c in fetched if c.closed]
             frames[tf] = summarize_timeframe(candles)
             if tf == decision_timeframe:
                 recent = compact_candles(candles)
+                last = fetched[-1] if fetched else None
+                if last is not None:
+                    live = {"prix": last.close, "heure_utc": datetime.now(UTC).strftime("%Y-%m-%d %H:%M"),
+                            "bougie_en_cours": None if last.closed else {
+                                "ouverture": last.open_time.strftime("%Y-%m-%d %H:%M"), "open": last.open,
+                                "high": last.high, "low": last.low, "volume": last.volume},
+                            "variation_depuis_derniere_cloture_pct": _pct(last.close, candles[-1].close)
+                            if candles and not last.closed else 0.0}
         spec = instrument(symbol)
         now = datetime.now(UTC)
         is_open = market_open(spec.calendar, now)
         context: dict[str, Any] = {
             "symbole": symbol, "timeframe_de_decision": decision_timeframe,
+            "prix_actuel": live,
             "instrument": {"nom": spec.name, "classe": spec.asset_class, "devise": spec.currency,
                            "marche": CALENDAR_LABELS[spec.calendar], "ouvert": is_open,
                            "prochaine_ouverture": None if is_open else next_market_open(spec.calendar, now).isoformat(),

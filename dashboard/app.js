@@ -21,6 +21,12 @@
   const CLASS_LABELS = { crypto: "Crypto", stock: "Actions", etf: "ETF et indices", forex: "Forex" };
   const EXIT_LABELS = { STOP_LOSS: "SL", TAKE_PROFIT: "TP", TAKE_PROFIT_1: "TP1", TRAILING_STOP: "Trailing", MARKET: "Sortie" };
 
+  // Lien ouvert par « Lancer le bot.bat » : …/dashboard/#token=… (le fragment n'est jamais envoyé au serveur).
+  const hashToken = (location.hash.match(/token=([^&]+)/) || [])[1];
+  if (hashToken) {
+    store.set(TOKEN_KEY, decodeURIComponent(hashToken));
+    history.replaceState(null, "", location.pathname + location.search);
+  }
   const saved = (() => { try { return JSON.parse(store.get(VIEW_KEY) || "{}"); } catch { return {}; } })();
   const state = {
     token: store.get(TOKEN_KEY), status: null, symbol: saved.symbol || null, tf: saved.tf || "1h",
