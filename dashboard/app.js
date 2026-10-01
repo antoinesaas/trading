@@ -27,6 +27,7 @@
     store.set(TOKEN_KEY, decodeURIComponent(hashToken));
     history.replaceState(null, "", location.pathname + location.search);
   }
+  window.addEventListener("hashchange", () => { if (/token=/.test(location.hash)) location.reload(); });
   const saved = (() => { try { return JSON.parse(store.get(VIEW_KEY) || "{}"); } catch { return {}; } })();
   const state = {
     token: store.get(TOKEN_KEY), status: null, symbol: saved.symbol || null, tf: saved.tf || "1h",
